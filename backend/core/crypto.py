@@ -9,6 +9,7 @@
 """
 
 import logging
+import sys
 import threading
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -42,7 +43,22 @@ def get_cipher():
                 )
                 _cipher_warned = True
             return None
-        _cipher = Fernet(PROFILE_ENCRYPTION_KEY.encode("ascii"))
+        try:
+            _cipher = Fernet(PROFILE_ENCRYPTION_KEY.encode("ascii"))
+        except (ValueError, UnicodeEncodeError) as e:
+            # 非法密钥（占位值/带空格/截断/非 ASCII 等）：不抛原始异常栈，
+            # 改为输出明确中文提示并拒启，保持与 core.config._fail 相同的提示风格。
+            # 注意“密钥未配置（空）时明文模式”的既有语义不变，仍由上方分支处理。
+            print(
+                "[配置错误] PROFILE_ENCRYPTION_KEY 不是合法的 Fernet 密钥，"
+                "请检查 backend/.env 中的配置（常见原因：占位值未替换、包含空格、"
+                "密钥被截断）。生成命令见 .env.example：\n"
+                '    python -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())"\n'
+                f"（原始错误：{e}）",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         return _cipher
 
 

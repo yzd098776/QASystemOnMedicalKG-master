@@ -9,6 +9,7 @@ import json
 import time
 import asyncio
 import logging
+import tempfile
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
@@ -119,18 +120,59 @@ def load_json(path: str) -> dict:
     return {}
 
 
-def save_json(path: str, data: dict):
-    """原子写：先写同目录临时文件，再 os.replace 覆盖目标文件，
-    避免写入中断时损坏原文件"""
-    tmp_path = path + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, path)
+def save_json(path: str, payload: str):
+    """原子写：先写同目录的“唯一”临时文件，再 os.replace 覆盖目标文件。
+
+    竞态背景：本函数会被多个 asyncio.to_thread 线程并发调用（各写盘任务在
+    线程池中真并发执行）。若使用固定临时文件名（path + ".tmp"），两个线程
+    同时写同一临时文件会互相覆盖，产出损坏的 JSON；而 load_json 对损坏文件
+    只记日志并返回 {}，导致重启后数据被静默清空。因此这里必须用带随机后缀的
+    唯一临时文件名，保证各写任务互不干扰。
+    入参 payload 为调用方已在事件循环线程内序列化好的 JSON 字符串快照，
+    线程内不再触碰活字典，避免序列化期间字典被并发修改。
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    # mkstemp 生成同目录下带随机后缀的唯一临时文件，天然避免并发写同一临时文件；
+    # 以 fd 方式打开并立即关闭，避免 Windows 上临时文件被占用导致 os.replace 失败，
+    # 后续用普通方式按 UTF-8 重写内容（文件已以二进制独占模式创建）
+    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    os.close(fd)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        # 写成功后原子替换目标文件。Windows 上临时文件刚关闭时可能被杀毒软件等
+        # 短暂占用，导致 os.replace 报 WinError 5（拒绝访问），故对替换操作做
+        # 短间隔有限重试；仍失败则走异常路径清理临时文件并抛出（原文件不受影响）
+        last_error = None
+        for _ in range(10):
+            try:
+                os.replace(tmp_path, path)
+                last_error = None
+                break
+            except PermissionError as e:
+                last_error = e
+                time.sleep(0.05)
+        if last_error is not None:
+            raise last_error
+    except OSError:
+        # 异常路径：清理残留临时文件后向上抛出，交由调用方感知（不吞异常）
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 async def save_json_async(path: str, data: dict):
-    """异步包装：阻塞的文件写入放入线程池执行，不阻塞事件循环"""
-    await asyncio.to_thread(save_json, path, data)
+    """异步包装：阻塞的文件写入放入线程池执行，不阻塞事件循环。
+
+    快照策略：先在事件循环线程内执行 json.dumps 取得字符串快照——此时没有
+    其他协程并发修改字典（协程调度不会在同步语句中间切换），再把不可变的字符串
+    交给线程池写盘。若把活字典直接交给线程序列化，期间其他协程修改字典会触发
+    "dictionary changed size during iteration"，或写出前后不一致的快照。
+    """
+    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    await asyncio.to_thread(save_json, path, payload)
 
 
 users_db = load_json(USERS_FILE)
@@ -181,7 +223,9 @@ def _migrate_profile_ciphertext():
                 profile[field] = encrypt_field(value)
                 changed = True
     if changed:
-        save_json(PROFILES_FILE, profiles_db)
+        # save_json 接收已序列化的 JSON 字符串：此处为启动期同步路径，
+        # 先在当前线程完成 dumps 快照再写盘，与异步路径的快照策略保持一致
+        save_json(PROFILES_FILE, json.dumps(profiles_db, ensure_ascii=False, indent=2))
         logger.info("健康档案敏感字段存量加密迁移完成")
 
 

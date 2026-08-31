@@ -61,13 +61,12 @@ export const useUserStore = defineStore('user', () => {
   }
 
   async function logout() {
-    // 先通知后端登出（jti 黑名单 + token_version 自增，令牌即时失效），
-    // 失败不阻断本地登出流程；随后清理本地全部登录态（含 refresh_token）
-    try {
-      await request.post('/api/auth/logout')
-    } catch {
-      // 登出接口失败时仅清理本地状态即可，静默处理（不弹错）
-    }
+    // 先清本地再通知服务端，避免路由守卫竞态：
+    // 若先 await 后端登出再清本地，调用方（MainLayout.handleLogout）未 await 就
+    // router.push('/login')，此时 token 仍在 localStorage，路由守卫会把导航弹回首页。
+    // 同步清空本地全部登录态（含 refresh_token）后，路由守卫立即看到已登出状态；
+    // 同时保持调用方现有同步语义（调用返回时本地必定已清理完毕）
+    const authHeader = token.value ? `Bearer ${token.value}` : ''
     token.value = ''
     refreshToken.value = ''
     userInfo.value = null
@@ -76,6 +75,18 @@ export const useUserStore = defineStore('user', () => {
     localStorage.removeItem('refresh_token')
     localStorage.removeItem('userInfo')
     localStorage.removeItem('profile')
+    // 再通知后端登出（jti 黑名单 + token_version 自增）：不 await 阻塞调用方。
+    // 本地已先清，请求拦截器取不到新 token，故显式携带登出前快照的 Authorization；
+    // _skipAuthError 标记豁免统一 401 处理（旧会话过期时不弹「登录已过期」），
+    // 清存储与跳转本就由本函数负责，无需拦截器兜底。失败仅静默，不弹错。
+    request
+      .post('/api/auth/logout', null, {
+        _skipAuthError: true,
+        headers: authHeader ? { Authorization: authHeader } : {},
+      })
+      .catch(() => {
+        // 登出接口失败时本地状态已清理完毕，静默处理即可（不弹错）
+      })
   }
 
   return {

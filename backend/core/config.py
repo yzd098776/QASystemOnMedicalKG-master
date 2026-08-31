@@ -75,6 +75,14 @@ if any(p in JWT_SECRET.lower() for p in _WEAK_PATTERNS):
         "请更换为强随机值：\n"
         '    python -c "import secrets; print(secrets.token_urlsafe(32))"'
     )
+# 字符多样性校验：子串黑名单可被 32 位单一字符（如 32 个 a）等弱值绕过，
+# 要求至少包含 8 种不同字符，进一步降低暴力破解风险
+if len(set(JWT_SECRET)) < 8:
+    _fail(
+        "JWT_SECRET 字符多样性不足（不同字符少于 8 种，如 32 位单一字符），"
+        "存在被暴力破解的风险。请重新生成强随机值：\n"
+        '    python -c "import secrets; print(secrets.token_urlsafe(32))"'
+    )
 
 # access token 有效期（分钟）与 refresh token 有效期（天），均可通过 .env 覆盖
 ACCESS_TOKEN_EXPIRE_MINUTES = _read_int("ACCESS_TOKEN_EXPIRE_MINUTES", 30)

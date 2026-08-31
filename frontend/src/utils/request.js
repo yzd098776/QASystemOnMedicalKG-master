@@ -71,8 +71,19 @@ request.interceptors.response.use(
 
       switch (status) {
         case 401: {
-          // 刷新请求自身或登录请求的 401 不得再触发刷新（防死循环）
-          const isRefreshCall = url.includes('/api/auth/refresh') || url.includes('/api/auth/login')
+          // 豁免标记（如登出请求）：调用方自行负责清存储与跳转，
+          // 这里静默拒绝即可，不触发刷新/清理/提示，避免主动登出时弹「登录已过期」
+          if (original._skipAuthError) {
+            break
+          }
+          // 登录请求的 401（如密码错误）：展示后端 detail，不触发刷新也不跳转，
+          // 避免把「用户名或密码错误」误报为「登录已过期」
+          if (url.includes('/api/auth/login')) {
+            ElMessage.error(data?.detail || '用户名或密码错误')
+            break
+          }
+          // 刷新请求自身的 401 不得再触发刷新（防死循环）
+          const isRefreshCall = url.includes('/api/auth/refresh')
           const hasRefreshToken = !!localStorage.getItem('refresh_token')
           if (!original._retried && !isRefreshCall && hasRefreshToken) {
             try {
