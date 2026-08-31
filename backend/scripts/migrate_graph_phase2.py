@@ -6,10 +6,11 @@
 1. Disease 节点补 icd10 占位（空字符串）：待权威数据源（国家卫健委/WHO ICD-10
    官方对照表）对齐后回填，当前不编造编码值；
 2. Drug 节点补 atc 占位（空字符串）：待 ATC 官方索引对齐后回填，当前不编造；
-3. 六类核心关系（以库中实际存在者为准）补缺失属性：
+3. 八类核心关系（以库中实际存在者为准）补缺失属性：
    weight=1.0（默认等权，无可靠来源，仅供后续加权检索使用）、
    source="medical.json"（数据来源标注）、
    evidence_level="unverified"（未经临床证据核验）；
+   阶段三把 belongs_to、drugs_of 补入覆盖清单（此前遗漏，均被线上接口使用）；
 4. 从 data/medical.json 读取每疾病的 get_prob（形如 "0.00002%"，解析为
    浮点百分比数值，单位仍为 %），幂等写入 Disease 节点；
 5. 症状 IDF：idf = log(1 + 总疾病数 / 关联该症状的疾病数)，
@@ -47,7 +48,8 @@ logger = logging.getLogger("migrate_graph_phase2")
 # 单批提交条数（分批事务，避免单个超大事务）
 BATCH_SIZE = 10000
 
-# 需要补属性的六类核心关系（执行前会先查 db.relationshipTypes()，只处理库中实际存在的类型）
+# 需要补属性的八类核心关系（阶段三补充 belongs_to / drugs_of：两者均被线上接口使用，
+# 此前遗漏导致属性覆盖不全；执行前会先查 db.relationshipTypes()，只处理库中实际存在的类型）
 TARGET_REL_TYPES = [
     "has_symptom",     # 疾病-症状
     "common_drug",     # 疾病-常用药品
@@ -55,6 +57,8 @@ TARGET_REL_TYPES = [
     "no_eat",          # 疾病-忌吃食物
     "need_check",      # 疾病-诊断检查
     "acompany_with",   # 疾病-并发症
+    "belongs_to",      # 疾病-所属科室 / 科室-上级科室（阶段三补入）
+    "drugs_of",        # 厂商-生产药品（阶段三补入）
 ]
 
 # get_prob 解析正则：取字符串中第一个「数字%」片段；

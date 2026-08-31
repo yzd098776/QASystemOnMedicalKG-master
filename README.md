@@ -100,9 +100,9 @@
 | `Drug.atc` | ATC 编码，当前为 `""` 占位（同上） |
 | `Disease.get_prob` | 疾病患病先验（百分比数值），源自 `data/medical.json` 的 `get_prob` 字段 |
 | `Symptom.idf` | 症状逆文档频率 `log(1+总疾病数/关联疾病数)`，越常见的症状权重越低 |
-| 六类疾病关系属性 | `has_symptom / common_drug / do_eat / no_eat / need_check / acompany_with` 补齐 `weight`（默认 1.0）、`source`（默认 `"medical.json"`）、`evidence_level`（默认 `"unverified"`，默认值含义见迁移脚本注释） |
-| 索引/约束 | 七类实体标签的 `name` 唯一约束（存在重名的标签自动降级普通索引并告警），后端启动与建图脚本均幂等执行 |
-| 别名归一化 | `backend/data/aliases.json` 收录 27 条口语别名→规范实体名映射（如 感冒→上呼吸道感染、拉肚子→腹泻），图谱查询类接口统一先归一化再查询，未命中原词兜底再查 |
+| 关系属性 | `has_symptom / common_drug / do_eat / no_eat / need_check / acompany_with / belongs_to / drugs_of` 八类关系补齐 `weight`（默认 1.0）、`source`（默认 `"medical.json"`）、`evidence_level`（默认 `"unverified"`，默认值含义见迁移脚本注释） |
+| 索引/约束 | 七类实体标签的 `name` 唯一约束（存在重名的标签自动降级普通索引并告警，重名清洗后重跑可自动升级回约束）；无标签实体定位查询（实体详情/路径/关联）已改写为逐标签分支命中标签级索引，dbHits 从 ~4.4 万降至两位数；后端启动与建图脚本均幂等执行 |
+| 别名归一化 | `backend/data/aliases.json` 收录口语别名→规范实体名映射，覆盖疾病/症状/药品三类（如 感冒→上呼吸道感染、扑热息痛→对乙酰氨基酚片），具体条数以词典文件为准；图谱查询类接口统一先归一化再查询，未命中原词兜底再查 |
 
 ---
 
@@ -359,6 +359,7 @@ python scripts/migrate_graph_phase2.py
 ```
 
 脚本会打印每一步受影响行数与最终汇总；重复执行时占位与关系属性步骤应显示 0 行。
+注意：`Disease.icd10` / `Drug.atc` 占位值为空字符串（非 NULL），未来做编码缺失检测时请用 `IS NULL OR = ''` 判断。
 
 ### 7.3 后端配置与启动
 

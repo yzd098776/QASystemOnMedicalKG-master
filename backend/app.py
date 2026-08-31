@@ -515,6 +515,30 @@ def _alias_candidates(value):
     return [value]
 
 
+# 标签遍历固定顺序（字母序）：保证生成 Cypher 稳定，便于缓存查询计划与日志排查
+_LABEL_SCAN_ORDER = tuple(sorted(ALLOWED_LABELS))
+
+
+def _name_match_union(var: str, param: str) -> str:
+    """生成「按 name 跨七类实体标签查节点」的 CALL 子查询片段（含 CALL 包裹）。
+
+    背景（阶段三索引收益落地）：无标签 `MATCH (n {name:...})` 无法命中任何标签级
+    唯一约束/索引，PROFILE 实测为 AllNodesScan 全表扫描（~4.4 万 dbHits）。
+    曾尝试方案一：建 token-less 全局索引 `CREATE INDEX IF NOT EXISTS FOR (n) ON (n.name)`，
+    实测本库 Neo4j 5.26 不支持无标签属性索引语法（服务端 SyntaxError）；
+    故采用方案二：按 ALLOWED_LABELS 拆成逐标签分支（UNION ALL），每个分支带标签后
+    命中对应标签的约束/索引（NodeIndexSeek，约 2 dbHits/分支），整体降至两位数。
+    标签仅来自 ALLOWED_LABELS 白名单，name 值仍以 $参数传入，无注入风险。
+    CALL 使用空变量作用域子句 `CALL () { ... }`（Neo4j 5 推荐写法，避免弃用告警；
+    子查询只需 $参数、不导入外部变量，参数在子查询内天然可见）。
+    """
+    branches = [
+        "MATCH (%s:%s {name: $%s}) RETURN %s" % (var, label, param, var)
+        for label in _LABEL_SCAN_ORDER
+    ]
+    return "CALL () {\n" + "\nUNION ALL\n".join(branches) + "\n}"
+
+
 @app.get("/api/kg/entities")
 async def search_entities(
     search: Optional[str] = None,
@@ -613,14 +637,37 @@ async def search_entities(
 
         return inner_nodes, inner_links, inner_total
 
-    # 别名归一化：先用规范名检索，未命中（0 条结果）时再用原词兜底重查，
-    # 避免词典偏差导致 0 召回；无搜索词时按 [None] 走原逻辑，行为不变
+    # 别名归一化（阶段三修正——模糊搜索两路合并）：
+    # CONTAINS 模糊搜索场景下，归一化名命中的结果与原词命中的结果「合并」而非二选一：
+    # 分别用规范名与原词各查一路，按 name 去重后合并返回（避免搜「感冒」只返回
+    # 「上呼吸道感染」相关实体而丢失所有名称含「感冒」的实体）；
+    # 合并后按原 limit 截断，保持分页语义；total 为全库实体总数，两路相同；
+    # 无别名映射（候选只有原词）或无搜索词时走单路原逻辑，行为不变。
+    # 精确匹配类接口不受影响，仍保持「规范名优先、未命中原词兜底」语义。
     nodes, links, total = [], [], 0
     search_terms = _alias_candidates(safe_search)
-    for idx, term in enumerate(search_terms):
-        nodes, links, total = await _do_search(term)
-        if nodes or idx == len(search_terms) - 1:
-            break
+    if len(search_terms) <= 1:
+        nodes, links, total = await _do_search(search_terms[0])
+    else:
+        merged_nodes, merged_links = [], []
+        seen_names = set()
+        seen_links = set()
+        for term in search_terms:
+            t_nodes, t_links, t_total = await _do_search(term)
+            total = t_total or total
+            for n in t_nodes:
+                # 按实体名去重（同名实体以先返回的一路为准，保留其标签与简介）
+                if n["name"] not in seen_names:
+                    seen_names.add(n["name"])
+                    merged_nodes.append(n)
+            for l in t_links:
+                link_key = (l["source"], l["target"], l["relType"])
+                if link_key not in seen_links:
+                    seen_links.add(link_key)
+                    merged_links.append(l)
+        # 合并后按原 limit 截断（两路各自已带分页参数，合并去重后再收口到单页容量）
+        nodes = merged_nodes[:limit]
+        links = merged_links
 
     return {"nodes": nodes, "links": links, "total": total}
 
@@ -632,21 +679,23 @@ async def get_entity_detail(name: str):
     entity_name = _validate_entity_input(name, "实体名称")
     if not entity_name:
         raise HTTPException(status_code=404, detail="实体不存在")
-    query = """
-    MATCH (n {name: $name})
-    OPTIONAL MATCH (n)-[:has_symptom]->(s:Symptom)
-    OPTIONAL MATCH (n)-[:common_drug]->(dr:Drug)
-    OPTIONAL MATCH (n)-[:do_eat]->(f:Food)
-    OPTIONAL MATCH (n)-[:need_check]->(c:Check)
-    OPTIONAL MATCH (s2:Symptom)<-[:has_symptom]-(d:Disease)
-    WHERE s2.name = n.name
-    RETURN n, labels(n)[0] AS label,
-      collect(DISTINCT s.name) AS symptoms,
-      collect(DISTINCT dr.name) AS drugs,
-      collect(DISTINCT f.name) AS foods,
-      collect(DISTINCT c.name) AS checks,
-      collect(DISTINCT d.name) AS diseases
-    """
+    # 实体定位改为逐标签分支（_name_match_union）：原无标签 MATCH (n {name:$name})
+    # 为全表扫描，逐标签后各分支走标签约束索引；后续 OPTIONAL MATCH 子句（含 s2 子句）语义不变
+    query = (
+        _name_match_union("n", "name") + "\n"
+        "OPTIONAL MATCH (n)-[:has_symptom]->(s:Symptom)\n"
+        "OPTIONAL MATCH (n)-[:common_drug]->(dr:Drug)\n"
+        "OPTIONAL MATCH (n)-[:do_eat]->(f:Food)\n"
+        "OPTIONAL MATCH (n)-[:need_check]->(c:Check)\n"
+        "OPTIONAL MATCH (s2:Symptom)<-[:has_symptom]-(d:Disease)\n"
+        "WHERE s2.name = n.name\n"
+        "RETURN n, labels(n)[0] AS label,\n"
+        "  collect(DISTINCT s.name) AS symptoms,\n"
+        "  collect(DISTINCT dr.name) AS drugs,\n"
+        "  collect(DISTINCT f.name) AS foods,\n"
+        "  collect(DISTINCT c.name) AS checks,\n"
+        "  collect(DISTINCT d.name) AS diseases\n"
+    )
     # 别名归一化：按候选序列（规范名优先、原词兜底）逐个精确查询，命中即返回；
     # 全部未命中时保持既有 404 契约；查询异常保持既有 500 契约（仅对最后一次尝试抛出）
     results = []
@@ -703,14 +752,16 @@ async def find_path(source: str, target: str, max_depth: int = Query(default=5, 
     if not 1 <= max_depth <= 10:
         raise HTTPException(status_code=400, detail="max_depth 必须在 1 到 10 之间")
 
-    query = """
-    MATCH path = shortestPath(
-        (a {name: $source})-[*..""" + str(max_depth) + """]->(b {name: $target})
+    # 起终点实体定位改为逐标签分支（_name_match_union），各分支命中标签约束索引；
+    # shortestPath 在已锚定的 a、b 节点集合间展开，语义与原无标签写法一致（变长上限仍由 max_depth 控制）
+    query = (
+        _name_match_union("a", "source") + "\n"
+        + _name_match_union("b", "target") + "\n"
+        + "MATCH path = shortestPath((a)-[*.." + str(max_depth) + "]->(b))\n"
+        + "RETURN [x IN nodes(path) | x.name] AS nodeNames,\n"
+        + "       [r IN relationships(path) | type(r)] AS relTypes\n"
+        + "LIMIT 5"
     )
-    RETURN [n IN nodes(path) | n.name] AS nodeNames,
-           [r IN relationships(path) | type(r)] AS relTypes
-    LIMIT 5
-    """
     try:
         # 别名归一化：起点/终点各自按（规范名优先、原词兜底）候选展开，
         # 组合按序尝试，命中路径即返回；全部未命中保持空路径契约（最多4次查询）
@@ -757,18 +808,21 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, 
     if not 1 <= depth <= 3:
         raise HTTPException(status_code=400, detail="depth 必须在 1 到 3 之间")
 
+    # 实体定位改为逐标签分支（_name_match_union），命中标签约束索引；后续展开逻辑不变
     if depth == 1:
-        query = """
-        MATCH (n {name: $entity})-[r]-(m)
-        RETURN DISTINCT m.name AS name, labels(m)[0] AS label
-        LIMIT 80
-        """
+        query = (
+            _name_match_union("n", "entity") + "\n"
+            "MATCH (n)-[r]-(m)\n"
+            "RETURN DISTINCT m.name AS name, labels(m)[0] AS label\n"
+            "LIMIT 80"
+        )
     else:
-        query = """
-        MATCH (n {name: $entity})-[*1..""" + str(depth) + """]-(m)
-        RETURN DISTINCT m.name AS name, labels(m)[0] AS label
-        LIMIT 200
-        """
+        query = (
+            _name_match_union("n", "entity") + "\n"
+            "MATCH (n)-[*1.." + str(depth) + "]-(m)\n"
+            "RETURN DISTINCT m.name AS name, labels(m)[0] AS label\n"
+            "LIMIT 200"
+        )
 
     try:
         # 别名归一化：规范名优先，原词兜底（未命中再用原词重查）
@@ -795,8 +849,8 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, 
             seen.add(r["name"])
             nodes.append({"name": r["name"], "label": r["label"]})
 
-    # 获取根节点的实际标签（基于实际命中的实体名）
-    root_query = "MATCH (n {name: $entity}) RETURN labels(n)[0] AS label"
+    # 获取根节点的实际标签（基于实际命中的实体名；同样走逐标签索引定位）
+    root_query = _name_match_union("n", "entity") + "\nRETURN labels(n)[0] AS label LIMIT 1"
     try:
         root_result = await run_cypher(root_query, {"entity": effective_entity})
         root_label = root_result[0]["label"] if root_result else "Disease"
@@ -849,7 +903,11 @@ async def _diagnosis_prior_context():
         "prior_median": prior_median,
         "default_idf": math.log(1.0 + max(total_diseases, 1)),
     }
-    _cache_set("diag_prior_context", ctx)
+    # 仅当查询真实成功（库中存在疾病节点）时才写缓存；
+    # 查询失败返回的降级值（prior_median=0、total_diseases=0）不缓存，
+    # 避免瞬时故障的降级结果被后续 300 秒内的请求复用，下次请求会重新尝试查询
+    if total_diseases > 0:
+        _cache_set("diag_prior_context", ctx)
     return ctx
 
 
@@ -881,12 +939,19 @@ async def diagnosis(req: DiagnosisRequest):
     # 档案性别/年龄加权未启用：图谱疾病节点本身不含性别倾向字段，
     # 且既有请求契约未接收年龄/性别参数（契约优先，不新增参数），故该项降级处理。
     ctx = await _diagnosis_prior_context()
+    # 阶段三修复（聚合下推）：加权聚合与排序全部在 Cypher 内完成并按基础分预筛前 100，
+    # 避免高频症状组合下数千行疾病全量回传；Python 侧只对 100 条预筛结果叠加先验精排取前 20。
+    # 预筛余量说明：先验贡献为 log(1+x) 阻尼项、幅度有限，100 → 20 的 5 倍余量足以吸收
+    # 先验叠加引起的排序波动；若未来先验量纲规范化后可按需调大余量。
     query = """
     MATCH (d:Disease)-[:has_symptom]->(s:Symptom)
     WHERE s.name IN $symptoms
     WITH d, collect(DISTINCT {symptom: s.name, weight: coalesce(s.idf, $defaultIdf)}) AS evidence
+    WITH d, evidence, reduce(acc = 0.0, e IN evidence | acc + e.weight) AS base
     RETURN d.name AS name, d.desc AS desc, d.cure_department AS department,
            evidence, d.get_prob AS prior
+    ORDER BY base DESC
+    LIMIT 100
     """
     # 把每个症状的归一化名与原词都纳入匹配集合（去重保序），提升口语化症状词召回；
     # 归一化名不存在时自然不命中，原词兜底召回不受影响，无需额外回查；
@@ -902,13 +967,36 @@ async def diagnosis(req: DiagnosisRequest):
         logger.error(f"诊断查询失败: {e}")
         return {"results": []}
 
+    # 阶段三修复（证据按输入症状归组）：$symptoms 同时含各输入症状的原词与归一化名，
+    # 若疾病同时关联两个症状节点（如「喉咙痛」与规范名「咽痛」各有一个节点），
+    # 两条证据会同时命中导致 matchedCount 可能大于输入症状数。
+    # 归组规则：逐输入症状把其归一化名命中的证据并入对应输入词条目，
+    # 每条输入症状至多贡献一条证据（命中词被消费后不再重复归入），
+    # 保证 matchedCount ≤ 输入症状数；match_evidence 的 symptom 字段展示输入词，
+    # 库中实际命中名不同时在括号内注明；库中命中的每条证据权重不丢不重，基础分不变。
+    def _group_evidence_by_input(evidence):
+        ev_map = {e["symptom"]: e for e in evidence}
+        used = set()
+        grouped = []
+        for s in symptoms:
+            for term in (normalize_alias(s), s):
+                hit = ev_map.get(term)
+                if hit is not None and term not in used:
+                    used.add(term)
+                    display = s if term == s else f"{s}（库中命中：{term}）"
+                    grouped.append({"symptom": display, "weight": hit["weight"]})
+                    break
+        return grouped
+
     # 逐疾病打分：基础分 = Σ命中症状 IDF 权重（未命中不计），再叠加阻尼后的疾病先验；
     # 先验为百分比数值（如 0.00002 表示 0.00002%），仅作相对排序权重使用，
     # 不代表临床概率；先验缺失/非数值时用中位数替代并注明降级口径；
     # 先验贡献 = log(1 + max(prior, 0))，负值/异常值按 0 处理（对数域非负）
     scored = []
     for r in results:
-        evidence = r["evidence"] or []
+        # 证据先按输入症状归组（保证 matchedCount ≤ 输入症状数）再计算基础分，
+        # 归组不改变权重总和，基础分与阶段二口径一致
+        evidence = _group_evidence_by_input(r["evidence"] or [])
         base_score = sum(float(e["weight"]) for e in evidence)
         prior_value = r["prior"]
         if isinstance(prior_value, (int, float)):
