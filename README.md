@@ -127,15 +127,16 @@
 - **工具栏**：放大/缩小/重置、导出 PNG 图片、按类型筛选
 - **外部跳转**：从百科页面点击"在知识图谱中查看"可定位到具体实体
 
-### 3.3 智能问答系统
+### 3.3 智能问答系统（GraphRAG）
 
-- **聊天界面**：类 ChatGPT 布局，左侧历史会话列表，右侧聊天窗口
-- **流式输出**：基于 Fetch + ReadableStream 实现打字机效果，支持中途停止
+- **聊天界面**：类 ChatGPT 布局，左侧历史会话列表，右侧聊天窗口；急症命中时渲染红色警示卡
+- **流式输出**：基于 Fetch + ReadableStream 实现打字机效果，支持中途停止；SSE 帧协议详见 3.9 节
 - **对话持久化**：聊天记录自动同步后端，支持重命名、删除、一键清空
-- **DeepSeek 集成**：后端代理转发，API 密钥安全存储在服务端
-- **系统提示词**：约束 AI 基于知识图谱数据回答，禁止给出用药剂量
-- **答案溯源**：回答末尾列出引用的实体，点击可跳转知识图谱
-- **降级方案**：未配置 API 密钥时，自动从知识图谱查询并格式化回答
+- **DeepSeek 集成**：后端代理转发，API 密钥安全存储在服务端 `.env`
+- **GraphRAG 管线**：意图路由（规则+词典，零 LLM）→ 图谱三元组检索增强 → 句子级来源溯源（详见 3.9 节）
+- **降级方案**：未配置 API 密钥时，自动从知识图谱查询并格式化回答，不报错
+- **系统提示词**：约束 AI 仅依据图谱三元组回答，禁止给出用药剂量与手术方案
+- **答案溯源**：句子级溯源，【T#】标记渲染为可点击角标，来源卡片展示三元组并可跳转知识图谱
 - **XSS 防护**：使用 marked + DOMPurify 安全渲染 Markdown
 
 ### 3.4 多症状疾病自查
@@ -174,6 +175,46 @@
 - **每日科普**：每日随机推荐健康科普文章
 - **实体详情**：百科卡片展示完整属性和关联实体
 - **咨询 AI**：每个实体均可一键跳转问答，自动填入相关提问
+
+### 3.9 GraphRAG 问答管线架构（阶段三）
+
+`/api/chat` 的全部问答逻辑收敛于 `backend/services/` 服务包，路由函数瘦身为参数校验 + 管线调用。对最后一条用户消息的处理分支如下（优先级自上而下）：
+
+```
+用户消息
+  │
+  ├─ 1. 急症红牌检测（services/emergency.py，最高优先级）
+  │     命中 red_flags.json 关键词/模式（且非「什么是X」类定义提问）→ emergency 帧 + 固定急诊引导 → [DONE]
+  │     不进行图谱检索、不调用 LLM
+  │
+  ├─ 2. 实体识别（services/entity_recognizer.py）
+  │     dict/*.txt 词典正向最大匹配 + aliases.json 别名归一化 + 否认词过滤，零 LLM 调用
+  │
+  └─ 3. 意图路由（services/intent_router.py，规则优先）
+        ├─ drug_safety   ≥2 种药品实体 → 复用药物相互作用逻辑，不调 LLM
+        ├─ diagnosis     ≥2 症状实体或自查措辞 → 复用 /api/diagnosis 加权诊断，不调 LLM
+        ├─ graph_lookup  单实体 + 百科措辞 → 图谱数据组织结构化回答，不调 LLM
+        └─ rag           其余 → 混合检索三元组 → DeepSeek 流式回答（无密钥时降级为图谱结构化回答）
+```
+
+**SSE 帧协议**（既有帧不变，仅新增类型）：
+
+| 帧 | 时机 | 说明 |
+| --- | --- | --- |
+| `data: {"content": "..."}` | 流式过程中 | 流式文本（既有，【T#】来源标记保留原文输出） |
+| `data: [DONE]` | 结束 | 既有结束帧 |
+| `data: {"emergency": true, "message": ..., "guidance": ...}` | 最先 | 急症红牌，命中即终止后续检索 |
+| `data: {"intent": "..."}` | 可选首帧 | 说明命中的意图分支 |
+| `data: {"sources": [{id, subject, predicate, object, sentences}], "has_uncited": bool}` | 内容流结束后 | 被引用的图谱三元组及引用句序号 |
+
+**检索增强（rag 分支）**：实体识别结果 → 混合检索锤定实体（关键词路：别名归一 + `CONTAINS`；向量路：余弦相似）双路加权融合（权重见 `.env` 的 `HYBRID_KEYWORD_WEIGHT` / `HYBRID_VECTOR_WEIGHT`）→ 每实体取 1-2 跳邻居三元组（单实体≤20 条、总量≤60 条）→ 分配稳定编号 T1..Tn 注入提示词 → 模型仅依据三元组回答并在引用句末标注【T1】【T3】→ 后端解析标记生成 sources 帧。
+
+**向量检索方案与局限**：选型为 Neo4j 5.26 原生 vector index（免独立向量库运维），嵌入采用**纯 Python 哈希字符 n-gram 嵌入**（blake2b 特征哈希，默认 256 维，零新增依赖）。局限：哈希嵌入只能捕捉字面重合，**不具备语义理解能力**，对「脑子里嗡嗡响」这类口语召回依赖字面字符重合，效果有限。升级路径：未来可换用真实嵌入模型（如 sentence-transformers 或远程嵌入 API），仅需替换 `services/vector_index.py` 的 `embed()` 函数并重跑 `backend/scripts/build_vector_index.py` 重建索引（注意维度一致）。填充命令：`cd backend; python scripts/build_vector_index.py`（幂等，支持 `--limit` 试跑）。
+
+**急症红牌（3.6）**：关键词/模式表存于 `backend/data/red_flags.json`（中文注释、可扩展）。命中后先发 `emergency` 帧，再发固定急诊引导（立即拨打 120/前往急诊 + 免责声明），直接 `[DONE]`，**不进行图谱检索与 LLM 调用**，前端渲染为红色警示卡。为降低误报，「什么是胸痛」「休克的含义」这类**概念性定义提问**（命中强定义句式、且不含第一人称/急迫措辞）会豁免红牌、交回意图路由按百科/检索作答；任何真急症自述（如「我突然胸痛喘不上气」）仍立即触发，判据保守以安全优先。
+
+**Text2Cypher 长尾覆盖（白名单）**：仅在配置了 `DEEPSEEK_API_KEY` 且常规检索三元组不足（<3 条）时触发一次。后端不信任模型输出，强制校验：去注释后仅允许只读子句（MATCH / OPTIONAL MATCH / WHERE / WITH / RETURN / ORDER BY / SKIP / LIMIT / DISTINCT / AS / UNION），出现 CREATE/MERGE/DELETE/DETACH/SET/REMOVE/DROP/CALL/FOREACH/分号/多语句一律拒绝；无 LIMIT 自动追加 `LIMIT 50`；执行用带超时的 **Neo4j 只读访问模式**事务（`TEXT2CYPHER_TIMEOUT`；即便白名单校验漏网，服务端仍会拒绝任何写子句，形成纵深防御），结果行数上限 50。校验/执行/超时任一失败自动降级回常规检索增强流程。可通过 `TEXT2CYPHER_ENABLED=false` 关闭。
+
 
 ---
 

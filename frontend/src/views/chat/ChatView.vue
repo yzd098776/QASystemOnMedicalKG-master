@@ -143,6 +143,15 @@ async function sendMessage() {
     role: 'assistant',
     content: '',
     references: [],
+    // 阶段三 GraphRAG 新增字段：
+    // emergency: 急症红牌信息（命中急症时非空，渲染为红色警示卡）
+    // intent:    后端意图分支（可选展示）
+    // sources:   来源三元组列表 [{id, subject, predicate, object, sentences}]
+    // hasUncited: 是否存在未关联来源的句子（来源卡片提示用）
+    emergency: null,
+    intent: '',
+    sources: [],
+    hasUncited: false,
     timestamp: new Date().toISOString(),
     loading: true,
   })
@@ -225,6 +234,33 @@ async function sendMessage() {
     const decoder = new TextDecoder()
     let buffer = ''
 
+    // 解析单条 SSE data 载荷：区分既有 content 帧与阶段三新增的
+    // emergency / intent / sources 帧（未知字段一律忽略，保证向前兼容）
+    const handleSseData = (data) => {
+      if (data === '[DONE]') return
+      let parsed
+      try {
+        parsed = JSON.parse(data)
+      } catch {
+        return
+      }
+      if (parsed.emergency) {
+        aiMessage.emergency = { message: parsed.message || '', guidance: parsed.guidance || '' }
+        return
+      }
+      if (parsed.intent) {
+        aiMessage.intent = parsed.intent
+        return
+      }
+      if (Array.isArray(parsed.sources)) {
+        aiMessage.sources = parsed.sources
+        aiMessage.hasUncited = !!parsed.has_uncited
+        return
+      }
+      if (parsed.content) aiMessage.content += parsed.content
+      if (parsed.references) aiMessage.references = parsed.references
+    }
+
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
@@ -234,29 +270,12 @@ async function sendMessage() {
       buffer = lines.pop()
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const data = line.slice(6)
-          if (data === '[DONE]') break
-          try {
-            const parsed = JSON.parse(data)
-            if (parsed.content) aiMessage.content += parsed.content
-            if (parsed.references) aiMessage.references = parsed.references
-          } catch {}
-        }
+        if (line.startsWith('data: ')) handleSseData(line.slice(6))
       }
       throttledScroll()
     }
 
-    if (buffer.startsWith('data: ')) {
-      const data = buffer.slice(6)
-      if (data !== '[DONE]') {
-        try {
-          const parsed = JSON.parse(data)
-          if (parsed.content) aiMessage.content += parsed.content
-          if (parsed.references) aiMessage.references = parsed.references
-        } catch {}
-      }
-    }
+    if (buffer.startsWith('data: ')) handleSseData(buffer.slice(6))
   } catch (err) {
     if (err.name === 'AbortError') {
       aiMessage.content += '\n\n[已停止生成]'
@@ -305,9 +324,60 @@ function jumpToKG(entityName) {
   window.open(`/kg?entity=${encodeURIComponent(entityName)}`, '_blank')
 }
 
+// ========== 来源标记角标渲染（阶段三 3.5） ==========
+// 后端保留原文中的【T#】标记，前端渲染时转为可点击上标角标（不改变剪贴板复制的原文）
+
+// 关系谓词 -> 中文展示名（与后端来源三元组的 predicate 对应）
+const PREDICATE_LABELS = {
+  has_symptom: '症状',
+  common_drug: '常用药',
+  do_eat: '宜吃',
+  no_eat: '忌吃',
+  recommand_eat: '推荐食物',
+  need_check: '建议检查',
+  belongs_to: '所属科室',
+  acompany_with: '并发症',
+  drugs_of: '生产厂商',
+}
+
+function predicateLabel(p) {
+  return PREDICATE_LABELS[p] || p
+}
+
 function renderMarkdown(text) {
   if (!text) return ''
   return DOMPurify.sanitize(marked.parse(text, { breaks: true }))
+}
+
+// 在 markdown 渲染产物上把【T#】转为可点击角标；data-tid 供点击事件定位来源卡片。
+// DOMPurify 默认清洗自定义标签，但保留 class 与 data-* 属性，故用 <span> 实现。
+function renderContentWithMarkers(text) {
+  let html = renderMarkdown(text)
+  html = html.replace(/【T(\d+)】/g, (_m, n) => {
+    return `<span class="src-marker" data-tid="T${n}" title="来源 T${n}">${n}</span>`
+  })
+  return html
+}
+
+// 点击消息内容区：命中角标则展开来源卡片并闪烁定位，冒泡不阻止（避免误触）
+function handleContentClick(msg, event) {
+  const el = event.target.closest && event.target.closest('.src-marker')
+  if (!el) return
+  const tid = el.getAttribute('data-tid')
+  if (!tid || !msg.sources?.length) return
+  msg.sourcesExpanded = true
+  nextTick(() => {
+    const target = document.querySelector(`[data-source-id="${tid}"]`)
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      target.classList.add('src-flash')
+      setTimeout(() => target.classList.remove('src-flash'), 1600)
+    }
+  })
+}
+
+function toggleSources(msg) {
+  msg.sourcesExpanded = !msg.sourcesExpanded
 }
 </script>
 
@@ -405,13 +475,52 @@ function renderMarkdown(text) {
               ? 'bg-gradient-to-br from-primary-500 to-accent-500 text-white shadow-md shadow-primary-500/20'
               : 'bg-white/50 border border-white/60 backdrop-blur-sm'"
           >
+            <!-- 急症红牌警示卡（阶段三 3.6：置于 AI 消息顶部） -->
+            <div v-if="msg.emergency" class="emergency-card mb-3">
+              <div class="flex items-center gap-2">
+                <el-icon :size="18"><WarningFilled /></el-icon>
+                <span class="font-bold">{{ msg.emergency.message || '急症警示' }}</span>
+              </div>
+              <p v-if="msg.emergency.guidance" class="mt-1.5 text-sm leading-relaxed">{{ msg.emergency.guidance }}</p>
+            </div>
+
             <!-- Loading dots -->
             <div v-if="msg.loading && !msg.content" class="flex items-center gap-2">
               <span class="w-2 h-2 bg-primary-400 rounded-full animate-bounce"></span>
               <span class="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style="animation-delay: 0.1s"></span>
               <span class="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style="animation-delay: 0.2s"></span>
             </div>
-            <div v-else class="markdown-body text-sm" :class="msg.role === 'user' ? 'text-white' : ''" v-html="renderMarkdown(msg.content)"></div>
+            <div
+              v-else
+              class="markdown-body text-sm"
+              :class="msg.role === 'user' ? 'text-white' : ''"
+              v-html="renderContentWithMarkers(msg.content)"
+              @click="msg.role === 'assistant' && handleContentClick(msg, $event)"
+            ></div>
+
+            <!-- 来源卡片（阶段三 3.5：可展开的图谱三元组来源列表） -->
+            <div v-if="msg.role === 'assistant' && msg.sources?.length && !msg.loading" class="mt-3 pt-3 border-t border-surface-200/40">
+              <button class="flex items-center gap-1.5 text-xs text-primary-600 font-medium cursor-pointer hover:text-primary-700 transition-colors" @click="toggleSources(msg)">
+                <el-icon><Collection /></el-icon>
+                来源（{{ msg.sources.length }} 条图谱依据）
+                <el-icon class="transition-transform" :class="msg.sourcesExpanded ? 'rotate-90' : ''"><Right /></el-icon>
+              </button>
+              <div v-if="msg.sourcesExpanded" class="mt-2 space-y-1.5">
+                <p v-if="msg.hasUncited" class="text-xs text-surface-400">以下回答未能逐句关联来源，仅列出已引用的图谱依据。</p>
+                <div
+                  v-for="src in msg.sources"
+                  :key="src.id"
+                  :data-source-id="src.id"
+                  class="source-card"
+                >
+                  <span class="src-id">{{ src.id }}</span>
+                  <span class="src-entity cursor-pointer" @click="jumpToKG(src.subject)">{{ src.subject }}</span>
+                  <span class="src-pred">—{{ predicateLabel(src.predicate) }}→</span>
+                  <span class="src-entity cursor-pointer" @click="jumpToKG(src.object)">{{ src.object }}</span>
+                  <span v-if="src.sentences?.length" class="src-sents">（第 {{ src.sentences.join('、') }} 句）</span>
+                </div>
+              </div>
+            </div>
 
             <!-- References -->
             <div v-if="msg.references?.length" class="mt-3 pt-3 border-t border-white/20">
@@ -486,3 +595,75 @@ function renderMarkdown(text) {
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 急症红牌警示卡（阶段三 3.6） */
+.emergency-card {
+  border-radius: 12px;
+  padding: 12px 14px;
+  color: #b91c1c;
+  background: linear-gradient(135deg, #fef2f2, #fee2e2);
+  border: 1px solid #fca5a5;
+  box-shadow: 0 2px 10px rgba(220, 38, 38, 0.12);
+}
+
+/* 来源角标：上标样式，点击定位来源卡片 */
+.markdown-body :deep(.src-marker) {
+  display: inline-block;
+  min-width: 1.1em;
+  margin: 0 1px;
+  padding: 0 4px;
+  font-size: 0.72em;
+  line-height: 1.5;
+  text-align: center;
+  vertical-align: super;
+  color: #4f46e5;
+  background: rgba(79, 70, 229, 0.1);
+  border: 1px solid rgba(79, 70, 229, 0.25);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.markdown-body :deep(.src-marker:hover) {
+  background: #4f46e5;
+  color: #fff;
+}
+
+/* 来源三元组卡片 */
+.source-card {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(79, 70, 229, 0.08);
+  transition: border-color 0.2s, background 0.2s;
+}
+.source-card.src-flash {
+  border-color: #4f46e5;
+  background: rgba(79, 70, 229, 0.08);
+}
+.source-card .src-id {
+  font-weight: 600;
+  color: #4f46e5;
+  margin-right: 2px;
+}
+.source-card .src-entity {
+  color: #1e293b;
+  font-weight: 500;
+}
+.source-card .src-entity:hover {
+  color: #4f46e5;
+  text-decoration: underline;
+}
+.source-card .src-pred {
+  color: #94a3b8;
+}
+.source-card .src-sents {
+  color: #94a3b8;
+  font-size: 11px;
+}
+</style>

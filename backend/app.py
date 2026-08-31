@@ -22,14 +22,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, EmailStr
 import httpx
-from neo4j import GraphDatabase
 
 # 集中配置：导入时先加载 backend/.env，再校验 JWT_SECRET 等强安全项，校验失败拒启；
 # 必须在读取任何环境变量之前导入，保证加载顺序正确
 from core.config import (
-    NEO4J_URI,
-    NEO4J_USER,
-    NEO4J_PASSWORD,
     DEEPSEEK_API_KEY,
     DEEPSEEK_API_URL,
     ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -55,6 +51,13 @@ from core.crypto import encrypt_field, decrypt_field, get_cipher, has_ciphertext
 from core.graph_index import ensure_graph_indexes
 # 实体别名归一化（阶段二，详见 core/alias.py 与 backend/data/aliases.json）
 from core.alias import normalize as normalize_alias, preload_alias_map
+# GraphRAG 问答管线（阶段三，详见 services/ 包）
+from services.graph_db import get_driver, run_cypher, run_cypher_sync, close_driver
+from services import entity_recognizer, emergency as emergency_service
+from services.rag_pipeline import run_graphrag_chat
+from services.diagnosis_service import run_diagnosis
+from services.drug_service import run_drug_interaction, run_drug_contraindication
+from services.vector_index import ensure_vector_indexes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -64,30 +67,8 @@ if not DEEPSEEK_API_KEY:
 
 
 # ========== Neo4j 连接 ==========
-driver = None
-
-
-def get_driver():
-    global driver
-    if driver is None:
-        driver = GraphDatabase.driver(
-            NEO4J_URI,
-            auth=(NEO4J_USER, NEO4J_PASSWORD),
-            max_connection_pool_size=50,
-            connection_acquisition_timeout=30,
-        )
-    return driver
-
-
-def _run_cypher_sync(query: str, parameters: dict = None):
-    d = get_driver()
-    with d.session() as session:
-        result = session.run(query, parameters or {})
-        return [dict(record) for record in result]
-
-
-async def run_cypher(query: str, parameters: dict = None):
-    return await asyncio.to_thread(_run_cypher_sync, query, parameters)
+# 驱动与 Cypher 执行工具已抽取至 services/graph_db（阶段三），
+# 本文件顶部统一从该模块导入 get_driver / run_cypher / run_cypher_sync
 
 
 # ========== 简单缓存 ==========
@@ -343,10 +324,7 @@ async def lifespan(app: FastAPI):
     # 全部为 IF NOT EXISTS 幂等语句，重名标签自动降级为普通索引；
     # 失败仅告警不阻断启动，保证接口可用性优先
     try:
-        def _sync_runner(cypher, params=None):
-            return _run_cypher_sync(cypher, params)
-
-        await asyncio.to_thread(ensure_graph_indexes, _sync_runner)
+        await asyncio.to_thread(ensure_graph_indexes, run_cypher_sync)
     except Exception as e:
         logger.warning(f"启动时图谱索引/约束检查失败（不阻断启动）: {e}")
     # 启动时一次性预加载别名词典（失败仅告警降级，不阻断启动）
@@ -354,10 +332,22 @@ async def lifespan(app: FastAPI):
         logger.info(f"别名词典预加载完成，共 {preload_alias_map()} 条映射")
     except Exception as e:
         logger.warning(f"别名词典预加载失败（不阻断启动）: {e}")
+    # 启动时预热实体识别词典与急症红牌表（阶段三，失败仅告警降级）
+    try:
+        entity_total, deny_total = entity_recognizer.preload()
+        logger.info(f"实体识别词典预加载完成：{entity_total} 个实体词，{deny_total} 个否认词")
+        logger.info(f"急症红牌关键词表预加载完成，共 {emergency_service.preload()} 个关键词")
+    except Exception as e:
+        logger.warning(f"问答词典预加载失败（不阻断启动）: {e}")
+    # 启动时幂等地创建向量索引（阶段三；仅建索引不填充嵌入，
+    # 填充由 scripts/build_vector_index.py 执行；失败仅告警不阻断启动）
+    try:
+        await asyncio.to_thread(ensure_vector_indexes, run_cypher_sync)
+    except Exception as e:
+        logger.warning(f"启动时向量索引检查失败（不阻断启动）: {e}")
     yield
     # 关闭时清理
-    if driver:
-        driver.close()
+    close_driver()
 
 
 app = FastAPI(
@@ -877,44 +867,14 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, 
 
 
 # ========== 疾病自查接口 ==========
-async def _diagnosis_prior_context():
-    """诊断加权上下文（缓存5分钟）：全库疾病先验中位数 + 默认 IDF。
-    - 先验中位数：疾病 get_prob 缺失时的替代值（不伪造个体风险，避免一律归零）；
-    - 默认 IDF：症状缺失 idf（迁移未执行）时的兜底权重，取总疾病数对应的最大 IDF"""
-    cached = _cache_get("diag_prior_context", ttl=300)
-    if cached:
-        return cached
-    priors = []
-    try:
-        rows = await run_cypher(
-            "MATCH (d:Disease) WHERE d.get_prob IS NOT NULL RETURN d.get_prob AS p"
-        )
-        priors = sorted(float(r["p"]) for r in rows if r["p"] is not None)
-    except Exception as e:
-        logger.error(f"诊断先验中位数查询失败: {e}")
-    prior_median = priors[len(priors) // 2] if priors else 0.0
-    total_diseases = 0
-    try:
-        rows = await run_cypher("MATCH (d:Disease) RETURN count(d) AS c")
-        total_diseases = rows[0]["c"] if rows else 0
-    except Exception:
-        total_diseases = 0
-    ctx = {
-        "prior_median": prior_median,
-        "default_idf": math.log(1.0 + max(total_diseases, 1)),
-    }
-    # 仅当查询真实成功（库中存在疾病节点）时才写缓存；
-    # 查询失败返回的降级值（prior_median=0、total_diseases=0）不缓存，
-    # 避免瞬时故障的降级结果被后续 300 秒内的请求复用，下次请求会重新尝试查询
-    if total_diseases > 0:
-        _cache_set("diag_prior_context", ctx)
-    return ctx
-
-
 @app.post("/api/diagnosis")
 async def diagnosis(req: DiagnosisRequest):
     # 空症状项跳过（保持既有行为）；单个症状项超过200字符返回 400；
-    # 症状列表经参数化（$symptoms）传入，无需黑名单过滤
+    # 症状列表经参数化（$symptoms）传入，无需黑名单过滤；
+    # 加权诊断核心逻辑（阶段三）已抽取至 services/diagnosis_service，
+    # 供本路由与问答管线的 diagnosis 意图分支复用，行为与口径不变：
+    # score = Σ(命中症状 IDF 权重) + log(1 + 疾病先验)，按分取前 20，
+    # 响应字段与原契约完全一致（新增字段 match_evidence / prior 保留）
     symptoms = []
     for s in req.symptoms:
         item = _validate_entity_input(s, "症状项")
@@ -922,215 +882,22 @@ async def diagnosis(req: DiagnosisRequest):
             symptoms.append(item)
     if not symptoms:
         raise HTTPException(status_code=400, detail="请至少提供一个症状")
-    # 症状词别名归一化：把每个症状的规范名一并加入匹配集合（原词保留），
-    # 提升口语化症状词的召回；匹配结果中返回的是图谱内实际命中的症状名，契约不变
-
-    # ========== 加权诊断（阶段二） ==========
-    # 打分公式：score = Σ(命中症状的 IDF 权重) + log(1 + 疾病先验 get_prob)；
-    # 症状 IDF 语义：越常见的症状区分度越低、权重越低（由迁移脚本写入）；
-    # 先验采用 log(1+x) 阻尼叠加而非直接相乘：语料先验量纲混乱（0~100 混杂，
-    # 部分是“某人群中发病率”而非普通人群患病率），直接相乘会让个别离群先验（如 90%）
-    # 彻底淹没症状证据；对数叠加保证先验只作有限幅度的加成/排序微调，
-    # 命中症状的证据仍是排序主导因素；
-    # 疾病先验缺失时用全库疾病先验的中位数替代（不伪造风险，避免一律归零）；
-    # probability 保持数值型：把分数归一化到 0-100（最高分疾病为 100 的相对置信度），
-    # 替代旧版“命中症状数/输入症状数”口径；其余字段名与原契约完全一致，
-    # 新增 match_evidence（证据明细）与 prior（疾病先验）两个新增字段。
-    # 档案性别/年龄加权未启用：图谱疾病节点本身不含性别倾向字段，
-    # 且既有请求契约未接收年龄/性别参数（契约优先，不新增参数），故该项降级处理。
-    ctx = await _diagnosis_prior_context()
-    # 阶段三修复（聚合下推）：加权聚合与排序全部在 Cypher 内完成并按基础分预筛前 100，
-    # 避免高频症状组合下数千行疾病全量回传；Python 侧只对 100 条预筛结果叠加先验精排取前 20。
-    # 预筛余量说明：先验贡献为 log(1+x) 阻尼项、幅度有限，100 → 20 的 5 倍余量足以吸收
-    # 先验叠加引起的排序波动；若未来先验量纲规范化后可按需调大余量。
-    query = """
-    MATCH (d:Disease)-[:has_symptom]->(s:Symptom)
-    WHERE s.name IN $symptoms
-    WITH d, collect(DISTINCT {symptom: s.name, weight: coalesce(s.idf, $defaultIdf)}) AS evidence
-    WITH d, evidence, reduce(acc = 0.0, e IN evidence | acc + e.weight) AS base
-    RETURN d.name AS name, d.desc AS desc, d.cure_department AS department,
-           evidence, d.get_prob AS prior
-    ORDER BY base DESC
-    LIMIT 100
-    """
-    # 把每个症状的归一化名与原词都纳入匹配集合（去重保序），提升口语化症状词召回；
-    # 归一化名不存在时自然不命中，原词兜底召回不受影响，无需额外回查；
-    # 症状缺失 IDF（迁移未执行）时用 $defaultIdf 兜底（总疾病数对应的最大 IDF）
-    symptom_terms = []
-    for s in symptoms:
-        for term in (normalize_alias(s), s):
-            if term not in symptom_terms:
-                symptom_terms.append(term)
-    try:
-        results = await run_cypher(query, {"symptoms": symptom_terms, "defaultIdf": ctx["default_idf"]})
-    except Exception as e:
-        logger.error(f"诊断查询失败: {e}")
-        return {"results": []}
-
-    # 阶段三修复（证据按输入症状归组）：$symptoms 同时含各输入症状的原词与归一化名，
-    # 若疾病同时关联两个症状节点（如「喉咙痛」与规范名「咽痛」各有一个节点），
-    # 两条证据会同时命中导致 matchedCount 可能大于输入症状数。
-    # 归组规则：逐输入症状把其归一化名命中的证据并入对应输入词条目，
-    # 每条输入症状至多贡献一条证据（命中词被消费后不再重复归入），
-    # 保证 matchedCount ≤ 输入症状数；match_evidence 的 symptom 字段展示输入词，
-    # 库中实际命中名不同时在括号内注明；库中命中的每条证据权重不丢不重，基础分不变。
-    def _group_evidence_by_input(evidence):
-        ev_map = {e["symptom"]: e for e in evidence}
-        used = set()
-        grouped = []
-        for s in symptoms:
-            for term in (normalize_alias(s), s):
-                hit = ev_map.get(term)
-                if hit is not None and term not in used:
-                    used.add(term)
-                    display = s if term == s else f"{s}（库中命中：{term}）"
-                    grouped.append({"symptom": display, "weight": hit["weight"]})
-                    break
-        return grouped
-
-    # 逐疾病打分：基础分 = Σ命中症状 IDF 权重（未命中不计），再叠加阻尼后的疾病先验；
-    # 先验为百分比数值（如 0.00002 表示 0.00002%），仅作相对排序权重使用，
-    # 不代表临床概率；先验缺失/非数值时用中位数替代并注明降级口径；
-    # 先验贡献 = log(1 + max(prior, 0))，负值/异常值按 0 处理（对数域非负）
-    scored = []
-    for r in results:
-        # 证据先按输入症状归组（保证 matchedCount ≤ 输入症状数）再计算基础分，
-        # 归组不改变权重总和，基础分与阶段二口径一致
-        evidence = _group_evidence_by_input(r["evidence"] or [])
-        base_score = sum(float(e["weight"]) for e in evidence)
-        prior_value = r["prior"]
-        if isinstance(prior_value, (int, float)):
-            prior_used = float(prior_value)
-        else:
-            prior_used = ctx["prior_median"]
-        prior_boost = math.log(1.0 + max(prior_used, 0.0))
-        score = base_score + prior_boost
-        scored.append({
-            "name": r["name"],
-            "desc": r["desc"] or "暂无简介",
-            "department": r["department"] or "暂无",
-            "evidence": evidence,
-            "prior_used": prior_used,
-            "prior_boost": prior_boost,
-            "prior": prior_value if isinstance(prior_value, (int, float)) else None,
-            "score": score,
-        })
-
-    # 按分数降序取前 20（与原接口 LIMIT 20 的数量上限一致）
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    top = scored[:20]
-
-    # 一次性批量查询头部疾病的检查项目（保持原 checks 字段，最多5项）
-    checks_map = {}
-    if top:
-        check_query = """
-        MATCH (d:Disease)-[:need_check]->(c:Check)
-        WHERE d.name IN $names
-        RETURN d.name AS name, collect(c.name) AS checks
-        """
-        try:
-            check_rows = await run_cypher(check_query, {"names": [t["name"] for t in top]})
-            for row in check_rows:
-                checks_map.setdefault(row["name"], []).extend(row["checks"] or [])
-        except Exception as e:
-            logger.error(f"诊断检查查询失败: {e}")
-
-    max_score = top[0]["score"] if top else 0.0
-    diagnosis_results = []
-    for t in top:
-        probability = round(t["score"] / max_score * 100) if max_score > 0 else 0
-        diagnosis_results.append({
-            "name": t["name"],
-            "desc": t["desc"],
-            "matchedSymptoms": [e["symptom"] for e in t["evidence"]],
-            "matchedCount": len(t["evidence"]),
-            "probability": probability,
-            "department": t["department"],
-            "checks": (checks_map.get(t["name"]) or [])[:5],
-            "prior": t["prior"],
-            "match_evidence": [
-                {
-                    "symptom": e["symptom"],
-                    "weight": round(float(e["weight"]), 4),
-                    # 单症状对基础分的贡献即其 IDF 权重（先验加成作用于疾病整体，
-                    # 不可拆分到单症状；未命中症状不计）
-                    "contribution": round(float(e["weight"]), 4),
-                }
-                for e in t["evidence"]
-            ],
-        })
-
-    return {"results": diagnosis_results}
+    return await run_diagnosis(symptoms)
 
 
 # ========== 用药安全接口 ==========
 @app.get("/api/drug/contraindication")
 async def drug_contraindication(drug: str):
     # 空药品名按未命中处理返回 404（与既有行为一致）；超长返回 400；
-    # 药品名经参数化（$name）传入，无需黑名单过滤
+    # 查询核心（阶段三）抽取至 services/drug_service，含别名归一化候选与降级逻辑；
+    # 服务返回 None 表示未找到药品，由本路由维持既有 404 契约；查询内部异常时
+    # 服务同样返回 None（与原实现抛出 500 的分支对应，此处保持 404 更贴近用户语义）
     safe_drug = _validate_entity_input(drug, "药品名称")
     if not safe_drug:
         raise HTTPException(status_code=404, detail="未找到该药品")
-
-    # 查询药品信息（别名归一化：规范名优先、原词兜底；每个候选先精确后模糊）
-    query = """
-    MATCH (dr:Drug {name: $name})
-    RETURN dr.name AS name
-    """
-    result = []
-    try:
-        for candidate in _alias_candidates(safe_drug):
-            result = await run_cypher(query, {"name": candidate})
-            if not result:
-                # 尝试模糊搜索（保持既有降级逻辑）
-                fuzzy_q = """
-                MATCH (dr:Drug)
-                WHERE dr.name CONTAINS $name
-                RETURN dr.name AS name
-                LIMIT 1
-                """
-                try:
-                    result = await run_cypher(fuzzy_q, {"name": candidate})
-                except Exception:
-                    result = []
-            if result:
-                break
-    except Exception as e:
-        logger.error(f"药品查询失败: {e}")
-        raise HTTPException(status_code=500, detail="查询失败")
-
-    if not result:
+    info = await run_drug_contraindication(safe_drug)
+    if info is None:
         raise HTTPException(status_code=404, detail="未找到该药品")
-
-    drug_name = result[0]["name"]
-
-    # 合并查询：主治疾病、忌吃食物、生产厂商
-    combined_q = """
-    MATCH (dr:Drug {name: $name})
-    OPTIONAL MATCH (dr)<-[:common_drug]-(d:Disease)
-    OPTIONAL MATCH (d)-[:no_eat]->(f:Food)
-    OPTIONAL MATCH (p:Producer)-[:drugs_of]->(dr)
-    RETURN collect(DISTINCT d.name) AS diseases,
-      collect(DISTINCT f.name) AS foods,
-      collect(DISTINCT p.name) AS producers
-    """
-    try:
-        cr = await run_cypher(combined_q, {"name": drug_name})
-        if cr:
-            r = cr[0]
-            info = {
-                "name": drug_name,
-                "disease": "、".join(r["diseases"][:5]) if r["diseases"] else "暂无",
-                "noEat": (r["foods"] or [])[:10],
-                "producer": "、".join(r["producers"][:3]) if r["producers"] else "暂无",
-                "contra": [],
-            }
-        else:
-            info = {"name": drug_name, "disease": "暂无", "noEat": [], "producer": "暂无", "contra": []}
-    except Exception as e:
-        logger.error(f"药品详情查询失败: {e}")
-        info = {"name": drug_name, "disease": "暂无", "noEat": [], "producer": "暂无", "contra": []}
-
     return info
 
 
@@ -1229,7 +996,9 @@ async def food_contraindication(query: str, type: str = "food"):
 
 @app.post("/api/drug/interaction")
 async def drug_interaction(req: DrugInteractionRequest):
-    # 空药品名跳过（保持既有行为）；超过200字符返回 400；药品名经参数化传入
+    # 空药品名跳过（保持既有行为）；超过200字符返回 400；药品名经参数化传入；
+    # 相互作用核心逻辑（阶段三）抽取至 services/drug_service，
+    # 供本路由与问答管线的 drug_safety 意图分支复用，响应契约不变
     drugs = []
     for d in req.drugs:
         item = _validate_entity_input(d, "药品名称")
@@ -1237,42 +1006,7 @@ async def drug_interaction(req: DrugInteractionRequest):
             drugs.append(item)
     if len(drugs) < 2:
         raise HTTPException(status_code=400, detail="请至少提供两种药品")
-
-    # 查询药品之间通过疾病建立的间接关系
-    interactions = []
-    for i in range(len(drugs)):
-        for j in range(i + 1, len(drugs)):
-            query = """
-            MATCH (d1:Drug {name: $drug1})<-[:common_drug]-(dis:Disease)-[:common_drug]->(d2:Drug {name: $drug2})
-            RETURN dis.name AS disease
-            LIMIT 5
-            """
-            try:
-                results = await run_cypher(query, {"drug1": drugs[i], "drug2": drugs[j]})
-                if results:
-                    diseases = [r["disease"] for r in results]
-                    interactions.append({
-                        "drug1": drugs[i],
-                        "drug2": drugs[j],
-                        "risk": "中",
-                        "description": f"两种药品均可用于治疗{'、'.join(diseases)}，同时使用前请咨询医生。",
-                    })
-                else:
-                    interactions.append({
-                        "drug1": drugs[i],
-                        "drug2": drugs[j],
-                        "risk": "低",
-                        "description": "未发现已知的药物相互作用，但建议遵医嘱使用。",
-                    })
-            except Exception:
-                interactions.append({
-                    "drug1": drugs[i],
-                    "drug2": drugs[j],
-                    "risk": "未知",
-                    "description": "暂无相关数据。",
-                })
-
-    return {"interactions": interactions}
+    return await run_drug_interaction(drugs)
 
 
 # ========== 就医指南接口 ==========
@@ -1685,7 +1419,9 @@ async def daily_tip():
     }
 
 
-# ========== DeepSeek AI 问答接口 ==========
+# ========== DeepSeek AI 问答接口（阶段三：GraphRAG 管线） ==========
+# 通用系统提示词（免责声明要求保留）：rag 分支在管线内会替换为
+# 带图谱三元组上下文的 GraphRAG 提示词（见 services/rag_pipeline）
 SYSTEM_PROMPT = """你是一个专业的医疗健康助手，必须优先使用提供的医疗知识图谱数据回答用户问题。
 回答要求：
 1. 所有涉及疾病、药品、症状的信息必须来自知识图谱，不确定的内容明确说明
@@ -1698,12 +1434,20 @@ SYSTEM_PROMPT = """你是一个专业的医疗健康助手，必须优先使用�
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest, request: Request, username: str = Depends(optional_user)):
+    """智能问答入口（请求契约不变）：仅做限流/参数校验与消息组装，
+    急症检测、意图路由、检索增强、DeepSeek 调用与来源溯源均由
+    services/rag_pipeline 的 GraphRAG 管线完成（SSE 帧协议见该模块头部说明）"""
     # 限流：IP + 登录用户（可选）双维度，防止滥用大模型接口（超限抛 429）
     client_ip = request.client.host if request.client else "unknown"
     check_rate_limit("chat-ip", client_ip, RATE_LIMIT_CHAT_PER_MINUTE)
     if username:
         check_rate_limit("chat-user", username, RATE_LIMIT_CHAT_PER_MINUTE)
-    # 构建消息
+
+    if not req.messages:
+        raise HTTPException(status_code=400, detail="消息列表不能为空")
+    question = req.messages[-1].content or ""
+
+    # 组装消息列表（[0] 为通用系统提示词，rag 分支在管线内替换为带图谱上下文的提示词）
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
     # 添加健康档案上下文（敏感字段解密后使用）
@@ -1726,139 +1470,16 @@ async def chat(req: ChatRequest, request: Request, username: str = Depends(optio
                 "content": f"用户健康档案：{'，'.join(parts)}",
             })
 
-    # 添加用户上下文
+    # 添加用户上下文与对话历史（与既有契约一致，最多取最近 10 条）
     if req.context:
         messages.append({"role": "system", "content": req.context})
-
-    # 添加对话历史
     for msg in req.messages[-10:]:
         messages.append({"role": msg.role, "content": msg.content})
 
-    # 如果没有配置API密钥，返回模拟响应
-    if not DEEPSEEK_API_KEY:
-        return await simulate_chat_response(req.messages[-1].content if req.messages else "")
-
-    # 调用DeepSeek API
-    async def generate():
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-            try:
-                async with client.stream(
-                    "POST",
-                    DEEPSEEK_API_URL,
-                    headers={
-                        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": "deepseek-chat",
-                        "messages": messages,
-                        "stream": True,
-                        "temperature": 0.7,
-                        "max_tokens": 2000,
-                    },
-                ) as response:
-                    if response.status_code != 200:
-                        yield f"data: {json.dumps({'content': 'AI服务暂时不可用，请稍后再试。'})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                yield "data: [DONE]\n\n"
-                                break
-                            try:
-                                chunk = json.loads(data)
-                                content = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                if content:
-                                    yield f"data: {json.dumps({'content': content})}\n\n"
-                            except Exception:
-                                pass
-            except Exception as e:
-                yield f"data: {json.dumps({'content': f'AI服务请求失败：{str(e)}'})}\n\n"
-                yield "data: [DONE]\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
-
-
-async def simulate_chat_response(question: str):
-    """模拟AI响应（当未配置DeepSeek API密钥时使用）"""
-
-    # 尝试从知识图谱获取相关信息
-    keywords = ["感冒", "发烧", "咳嗽", "头痛", "高血压", "糖尿病", "胃炎", "失眠"]
-    matched_keyword = None
-    for kw in keywords:
-        if kw in question:
-            matched_keyword = kw
-            break
-
-    if matched_keyword:
-        # 从知识图谱查询
-        query = """
-        MATCH (d:Disease {name: $name})
-        OPTIONAL MATCH (d)-[:has_symptom]->(s:Symptom)
-        OPTIONAL MATCH (d)-[:common_drug]->(dr:Drug)
-        OPTIONAL MATCH (d)-[:do_eat]->(f:Food)
-        OPTIONAL MATCH (d)-[:belongs_to]->(dep:Department)
-        RETURN d.name AS name, d.desc AS desc, d.cause AS cause, d.prevent AS prevent,
-               collect(DISTINCT s.name) AS symptoms,
-               collect(DISTINCT dr.name) AS drugs,
-               collect(DISTINCT f.name) AS foods,
-               collect(DISTINCT dep.name) AS departments
-        """
-        try:
-            results = await run_cypher(query, {"name": matched_keyword})
-            if results:
-                r = results[0]
-                response = f"## {r['name']}\n\n"
-                if r["desc"]:
-                    response += f"**简介：**{r['desc']}\n\n"
-                if r["cause"]:
-                    response += f"**病因：**{r['cause']}\n\n"
-                if r["symptoms"]:
-                    response += f"**常见症状：**{'、'.join(r['symptoms'][:10])}\n\n"
-                if r["drugs"]:
-                    response += f"**常用药品：**{'、'.join(r['drugs'][:10])}\n\n"
-                if r["foods"]:
-                    response += f"**宜吃食物：**{'、'.join(r['foods'][:10])}\n\n"
-                if r["prevent"]:
-                    response += f"**预防措施：**{r['prevent']}\n\n"
-                if r["departments"]:
-                    response += f"**就诊科室：**{'、'.join(r['departments'])}\n\n"
-                response += "\n以上内容仅供参考，如有不适请及时就医"
-
-                async def generate():
-                    # 按每5个字符分块发送，减少HTTP请求数
-                    chunk_size = 5
-                    for i in range(0, len(response), chunk_size):
-                        yield f"data: {json.dumps({'content': response[i:i+chunk_size]})}\n\n"
-                        await asyncio.sleep(0.05)
-                    yield "data: [DONE]\n\n"
-
-                return StreamingResponse(generate(), media_type="text/event-stream")
-        except Exception:
-            pass
-
-    # 默认响应
-    default_response = f"您好！您询问的是关于「{question}」的问题。\n\n"
-    default_response += "由于AI服务暂未配置API密钥，我基于知识图谱为您提供以下信息：\n\n"
-    default_response += "建议您：\n"
-    default_response += "1. 使用疾病自查功能，选择相关症状进行初步筛查\n"
-    default_response += "2. 使用知识图谱功能，搜索相关疾病和药品信息\n"
-    default_response += "3. 如有不适，请及时就医\n\n"
-    default_response += "以上内容仅供参考，如有不适请及时就医"
-
-    async def generate():
-        chunk_size = 5
-        for i in range(0, len(default_response), chunk_size):
-            yield f"data: {json.dumps({'content': default_response[i:i+chunk_size]})}\n\n"
-            await asyncio.sleep(0.05)
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    return StreamingResponse(
+        run_graphrag_chat(messages, question),
+        media_type="text/event-stream",
+    )
 
 
 # ========== 聊天记录存储 ==========

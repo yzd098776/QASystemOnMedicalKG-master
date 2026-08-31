@@ -35,6 +35,25 @@ def _read_int(name: str, default: int) -> int:
         _fail(f"{name} 必须为整数，当前值为 {raw!r}，请修正 backend/.env 后重启")
 
 
+def _read_float(name: str, default: float) -> float:
+    """读取浮点配置项，非法值直接拒启"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        _fail(f"{name} 必须为数字，当前值为 {raw!r}，请修正 backend/.env 后重启")
+
+
+def _read_bool(name: str, default: bool) -> bool:
+    """读取布尔配置项（1/true/yes/on 视为真，大小写不敏感）"""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # ========== Neo4j ==========
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
@@ -94,3 +113,19 @@ RATE_LIMIT_CHAT_PER_MINUTE = _read_int("RATE_LIMIT_CHAT_PER_MINUTE", 20)
 
 # ========== 健康档案敏感字段加密密钥（提交C使用，允许为空表示明文模式） ==========
 PROFILE_ENCRYPTION_KEY = os.getenv("PROFILE_ENCRYPTION_KEY") or ""
+
+# ========== GraphRAG 问答管线（阶段三） ==========
+# 混合检索双路权重：关键词路（别名+CONTAINS）与向量路（余弦相似），
+# 两者建议合计为 1.0（非强制，融合时按加权和排序）
+HYBRID_KEYWORD_WEIGHT = _read_float("HYBRID_KEYWORD_WEIGHT", 0.6)
+HYBRID_VECTOR_WEIGHT = _read_float("HYBRID_VECTOR_WEIGHT", 0.4)
+
+# 向量嵌入维度（哈希字符 n-gram 嵌入，须与建索引/写入维度一致，改动后需重建索引）
+EMBEDDING_DIM = _read_int("EMBEDDING_DIM", 256)
+
+# 向量索引名前缀（按标签生成 {前缀}_disease / {前缀}_drug / {前缀}_symptom）
+VECTOR_INDEX_PREFIX = os.getenv("VECTOR_INDEX_PREFIX", "kg_embedding")
+
+# Text2Cypher 长尾覆盖：总开关与只读执行超时（秒）
+TEXT2CYPHER_ENABLED = _read_bool("TEXT2CYPHER_ENABLED", True)
+TEXT2CYPHER_TIMEOUT = _read_int("TEXT2CYPHER_TIMEOUT", 10)
