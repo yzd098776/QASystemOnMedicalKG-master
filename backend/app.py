@@ -52,6 +52,8 @@ from core.ratelimit import check_rate_limit
 from core.crypto import encrypt_field, decrypt_field, get_cipher, has_ciphertext
 # 图谱索引/唯一约束幂等检查（阶段二，详见 core/graph_index.py）
 from core.graph_index import ensure_graph_indexes
+# 实体别名归一化（阶段二，详见 core/alias.py 与 backend/data/aliases.json）
+from core.alias import normalize as normalize_alias, preload_alias_map
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -346,6 +348,11 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(ensure_graph_indexes, _sync_runner)
     except Exception as e:
         logger.warning(f"启动时图谱索引/约束检查失败（不阻断启动）: {e}")
+    # 启动时一次性预加载别名词典（失败仅告警降级，不阻断启动）
+    try:
+        logger.info(f"别名词典预加载完成，共 {preload_alias_map()} 条映射")
+    except Exception as e:
+        logger.warning(f"别名词典预加载失败（不阻断启动）: {e}")
     yield
     # 关闭时清理
     if driver:
@@ -494,6 +501,19 @@ def _validate_entity_input(value, name="参数"):
     return value
 
 
+def _alias_candidates(value):
+    """构造别名归一化后的查询候选序列：归一化名优先，原词兜底。
+    各接入点按序尝试，命中即返回；全部未命中时由调用方按各自既有契约返回空结构。
+    传入 None 时返回 [None]（表示不带关键词查询）。
+    """
+    if value is None:
+        return [None]
+    normalized = normalize_alias(value)
+    if normalized and normalized != value:
+        return [normalized, value]
+    return [value]
+
+
 @app.get("/api/kg/entities")
 async def search_entities(
     search: Optional[str] = None,
@@ -507,86 +527,99 @@ async def search_entities(
 
     skip = (page - 1) * limit
 
-    if safe_search and safe_type:
-        query = """
-        MATCH (n)
-        WHERE n.name CONTAINS $search AND $type IN labels(n)
-        RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-        SKIP $skip LIMIT $limit
-        """
-        params = {"search": safe_search, "type": safe_type, "skip": skip, "limit": limit}
-    elif safe_search:
-        query = """
-        MATCH (n)
-        WHERE n.name CONTAINS $search
-        RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-        SKIP $skip LIMIT $limit
-        """
-        params = {"search": safe_search, "skip": skip, "limit": limit}
-    elif safe_type:
-        # Neo4j 标签不可参数化，仅允许白名单内的标签拼接进 Cypher；
-        # 非白名单标签返回空结果（保持既有行为兼容，不改为 400）
-        if safe_type not in ALLOWED_LABELS:
-            return {"nodes": [], "links": [], "total": 0}
-        query = f"""
-        MATCH (n:{safe_type})
-        RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-        SKIP $skip LIMIT $limit
-        """
-        params = {"skip": skip, "limit": limit}
-    else:
-        query = """
-        MATCH (n)
-        RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-        SKIP $skip LIMIT $limit
-        """
-        params = {"skip": skip, "limit": limit}
+    async def _do_search(search_term):
+        """按单个搜索词执行实体检索，返回 (nodes, links, total)"""
+        if search_term and safe_type:
+            query = """
+            MATCH (n)
+            WHERE n.name CONTAINS $search AND $type IN labels(n)
+            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
+            SKIP $skip LIMIT $limit
+            """
+            params = {"search": search_term, "type": safe_type, "skip": skip, "limit": limit}
+        elif search_term:
+            query = """
+            MATCH (n)
+            WHERE n.name CONTAINS $search
+            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
+            SKIP $skip LIMIT $limit
+            """
+            params = {"search": search_term, "skip": skip, "limit": limit}
+        elif safe_type:
+            # Neo4j 标签不可参数化，仅允许白名单内的标签拼接进 Cypher；
+            # 非白名单标签返回空结果（保持既有行为兼容，不改为 400）
+            if safe_type not in ALLOWED_LABELS:
+                return [], [], 0
+            query = f"""
+            MATCH (n:{safe_type})
+            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
+            SKIP $skip LIMIT $limit
+            """
+            params = {"skip": skip, "limit": limit}
+        else:
+            query = """
+            MATCH (n)
+            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
+            SKIP $skip LIMIT $limit
+            """
+            params = {"skip": skip, "limit": limit}
 
-    try:
-        results = await run_cypher(query, params)
-    except Exception as e:
-        logger.error(f"实体搜索失败: {e}")
-        return {"nodes": [], "links": [], "total": 0}
-
-    nodes = []
-    for r in results:
-        nodes.append({
-            "name": r["name"],
-            "label": r["label"],
-            "desc": r["props"].get("desc", ""),
-        })
-
-    # 获取关联边
-    if len(nodes) > 0:
-        names = [n["name"] for n in nodes[:50]]  # 限制边查询数量
-        link_query = """
-        MATCH (a)-[r]->(b)
-        WHERE a.name IN $names AND b.name IN $names
-        RETURN a.name AS source, b.name AS target, type(r) AS relType
-        LIMIT 200
-        """
         try:
-            link_results = await run_cypher(link_query, {"names": names})
-            links = [{"source": l["source"], "target": l["target"], "relType": l["relType"]} for l in link_results]
+            results = await run_cypher(query, params)
         except Exception as e:
-            logger.error(f"关联边查询失败: {e}")
-            links = []
-    else:
-        links = []
+            logger.error(f"实体搜索失败: {e}")
+            return [], [], 0
 
-    # 获取总数（缓存5分钟）
-    cached_total = _cache_get("kg_total_count", ttl=300)
-    if cached_total is not None:
-        total = cached_total
-    else:
-        count_query = "MATCH (n) RETURN count(n) AS total"
-        try:
-            count_result = await run_cypher(count_query)
-            total = count_result[0]["total"] if count_result else 0
-            _cache_set("kg_total_count", total)
-        except Exception as e:
-            logger.error(f"总数查询失败: {e}")
-            total = len(nodes)
+        inner_nodes = []
+        for r in results:
+            inner_nodes.append({
+                "name": r["name"],
+                "label": r["label"],
+                "desc": r["props"].get("desc", ""),
+            })
+
+        # 获取关联边
+        if len(inner_nodes) > 0:
+            names = [n["name"] for n in inner_nodes[:50]]  # 限制边查询数量
+            link_query = """
+            MATCH (a)-[r]->(b)
+            WHERE a.name IN $names AND b.name IN $names
+            RETURN a.name AS source, b.name AS target, type(r) AS relType
+            LIMIT 200
+            """
+            try:
+                link_results = await run_cypher(link_query, {"names": names})
+                inner_links = [{"source": l["source"], "target": l["target"], "relType": l["relType"]} for l in link_results]
+            except Exception as e:
+                logger.error(f"关联边查询失败: {e}")
+                inner_links = []
+        else:
+            inner_links = []
+
+        # 获取总数（缓存5分钟）
+        cached_total = _cache_get("kg_total_count", ttl=300)
+        if cached_total is not None:
+            inner_total = cached_total
+        else:
+            count_query = "MATCH (n) RETURN count(n) AS total"
+            try:
+                count_result = await run_cypher(count_query)
+                inner_total = count_result[0]["total"] if count_result else 0
+                _cache_set("kg_total_count", inner_total)
+            except Exception as e:
+                logger.error(f"总数查询失败: {e}")
+                inner_total = len(inner_nodes)
+
+        return inner_nodes, inner_links, inner_total
+
+    # 别名归一化：先用规范名检索，未命中（0 条结果）时再用原词兜底重查，
+    # 避免词典偏差导致 0 召回；无搜索词时按 [None] 走原逻辑，行为不变
+    nodes, links, total = [], [], 0
+    search_terms = _alias_candidates(safe_search)
+    for idx, term in enumerate(search_terms):
+        nodes, links, total = await _do_search(term)
+        if nodes or idx == len(search_terms) - 1:
+            break
 
     return {"nodes": nodes, "links": links, "total": total}
 
@@ -613,11 +646,21 @@ async def get_entity_detail(name: str):
       collect(DISTINCT c.name) AS checks,
       collect(DISTINCT d.name) AS diseases
     """
-    try:
-        results = await run_cypher(query, {"name": entity_name})
-    except Exception as e:
-        logger.error(f"实体详情查询失败: {e}")
-        raise HTTPException(status_code=500, detail="查询失败")
+    # 别名归一化：按候选序列（规范名优先、原词兜底）逐个精确查询，命中即返回；
+    # 全部未命中时保持既有 404 契约；查询异常保持既有 500 契约（仅对最后一次尝试抛出）
+    results = []
+    matched_name = entity_name
+    for idx, candidate in enumerate(_alias_candidates(entity_name)):
+        try:
+            results = await run_cypher(query, {"name": candidate})
+        except Exception as e:
+            logger.error(f"实体详情查询失败: {e}")
+            if idx == len(_alias_candidates(entity_name)) - 1:
+                raise HTTPException(status_code=500, detail="查询失败")
+            results = []
+        if results:
+            matched_name = candidate
+            break
 
     if not results:
         raise HTTPException(status_code=404, detail="实体不存在")
@@ -628,7 +671,7 @@ async def get_entity_detail(name: str):
     props = dict(node) if hasattr(node, 'items') else {}
 
     entity = {
-        "name": entity_name,
+        "name": matched_name,
         "label": label,
         "properties": props,
     }
@@ -668,7 +711,18 @@ async def find_path(source: str, target: str, max_depth: int = Query(default=5, 
     LIMIT 5
     """
     try:
-        results = await run_cypher(query, {"source": safe_source, "target": safe_target})
+        # 别名归一化：起点/终点各自按（规范名优先、原词兜底）候选展开，
+        # 组合按序尝试，命中路径即返回；全部未命中保持空路径契约（最多4次查询）
+        results = []
+        for source_candidate in _alias_candidates(safe_source):
+            for target_candidate in _alias_candidates(safe_target):
+                results = await run_cypher(
+                    query, {"source": source_candidate, "target": target_candidate}
+                )
+                if results:
+                    break
+            if results:
+                break
     except Exception as e:
         logger.error(f"路径查询失败: {e}")
         return {"paths": []}
@@ -716,7 +770,18 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, 
         """
 
     try:
-        results = await run_cypher(query, {"entity": safe_entity})
+        # 别名归一化：规范名优先，原词兜底（未命中再用原词重查）
+        results = []
+        effective_entity = safe_entity
+        for candidate in _alias_candidates(safe_entity):
+            try:
+                results = await run_cypher(query, {"entity": candidate})
+            except Exception as e:
+                logger.error(f"关联实体查询失败: {e}")
+                results = []
+            if results:
+                effective_entity = candidate
+                break
     except Exception as e:
         logger.error(f"关联实体查询失败: {e}")
         return {"nodes": [], "links": []}
@@ -729,14 +794,14 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, 
             seen.add(r["name"])
             nodes.append({"name": r["name"], "label": r["label"]})
 
-    # 获取根节点的实际标签
+    # 获取根节点的实际标签（基于实际命中的实体名）
     root_query = "MATCH (n {name: $entity}) RETURN labels(n)[0] AS label"
     try:
-        root_result = await run_cypher(root_query, {"entity": safe_entity})
+        root_result = await run_cypher(root_query, {"entity": effective_entity})
         root_label = root_result[0]["label"] if root_result else "Disease"
     except Exception:
         root_label = "Disease"
-    nodes.insert(0, {"name": safe_entity, "label": root_label})
+    nodes.insert(0, {"name": effective_entity, "label": root_label})
 
     links = []
     if len(nodes) > 1:
@@ -768,6 +833,8 @@ async def diagnosis(req: DiagnosisRequest):
             symptoms.append(item)
     if not symptoms:
         raise HTTPException(status_code=400, detail="请至少提供一个症状")
+    # 症状词别名归一化：把每个症状的规范名一并加入匹配集合（原词保留），
+    # 提升口语化症状词的召回；匹配结果中返回的是图谱内实际命中的症状名，契约不变
 
     # 查询所有包含这些症状的疾病及其症状、科室、检查（单次查询）
     query = """
@@ -780,8 +847,15 @@ async def diagnosis(req: DiagnosisRequest):
     RETURN d.name AS name, d.desc AS desc, d.cure_department AS department,
       matchedSymptoms, matchCount, collect(c.name) AS checks
     """
+    # 把每个症状的归一化名与原词都纳入匹配集合（去重保序），提升口语化症状词召回；
+    # 归一化名不存在时自然不命中，原词兜底召回不受影响，无需额外回查
+    symptom_terms = []
+    for s in symptoms:
+        for term in (normalize_alias(s), s):
+            if term not in symptom_terms:
+                symptom_terms.append(term)
     try:
-        results = await run_cypher(query, {"symptoms": symptoms})
+        results = await run_cypher(query, {"symptoms": symptom_terms})
     except Exception as e:
         logger.error(f"诊断查询失败: {e}")
         return {"results": []}
@@ -815,29 +889,32 @@ async def drug_contraindication(drug: str):
     if not safe_drug:
         raise HTTPException(status_code=404, detail="未找到该药品")
 
-    # 查询药品信息
+    # 查询药品信息（别名归一化：规范名优先、原词兜底；每个候选先精确后模糊）
     query = """
     MATCH (dr:Drug {name: $name})
     RETURN dr.name AS name
     """
+    result = []
     try:
-        result = await run_cypher(query, {"name": safe_drug})
+        for candidate in _alias_candidates(safe_drug):
+            result = await run_cypher(query, {"name": candidate})
+            if not result:
+                # 尝试模糊搜索（保持既有降级逻辑）
+                fuzzy_q = """
+                MATCH (dr:Drug)
+                WHERE dr.name CONTAINS $name
+                RETURN dr.name AS name
+                LIMIT 1
+                """
+                try:
+                    result = await run_cypher(fuzzy_q, {"name": candidate})
+                except Exception:
+                    result = []
+            if result:
+                break
     except Exception as e:
         logger.error(f"药品查询失败: {e}")
         raise HTTPException(status_code=500, detail="查询失败")
-
-    if not result:
-        # 尝试模糊搜索
-        fuzzy_q = """
-        MATCH (dr:Drug)
-        WHERE dr.name CONTAINS $name
-        RETURN dr.name AS name
-        LIMIT 1
-        """
-        try:
-            result = await run_cypher(fuzzy_q, {"name": safe_drug})
-        except Exception:
-            pass
 
     if not result:
         raise HTTPException(status_code=404, detail="未找到该药品")
@@ -884,49 +961,61 @@ async def food_contraindication(query: str, type: str = "food"):
         return {"name": query or "", "doEat": [], "noEat": [], "recommandEat": []}
 
     if type == "food":
-        # 按食物查询
+        # 按食物查询（别名归一化：规范名优先、原词兜底）
         q = """
         MATCH (f:Food {name: $name})
         RETURN f.name AS name
         """
-        try:
-            result = await run_cypher(q, {"name": safe_query})
-        except Exception:
-            return {"name": safe_query, "diseases": []}
+        result = []
+        effective_query = safe_query
+        for candidate in _alias_candidates(safe_query):
+            try:
+                result = await run_cypher(q, {"name": candidate})
+            except Exception:
+                result = []
+            if result:
+                effective_query = candidate
+                break
 
         if not result:
             return {"name": safe_query, "diseases": []}
 
-        # 查询不宜食用的疾病
+        # 查询不宜食用的疾病（基于实际命中的食物名）
         disease_q = """
         MATCH (f:Food {name: $name})<-[:no_eat]-(d:Disease)
         RETURN collect(d.name) AS diseases
         """
         try:
-            dr = await run_cypher(disease_q, {"name": safe_query})
+            dr = await run_cypher(disease_q, {"name": effective_query})
             diseases = dr[0]["diseases"] if dr else []
         except Exception:
             diseases = []
 
-        return {"name": safe_query, "diseases": diseases}
+        return {"name": effective_query, "diseases": diseases}
 
     else:
-        # 按疾病查询
+        # 按疾病查询（别名归一化：规范名优先、原词兜底）
         q = """
         MATCH (d:Disease {name: $name})
         RETURN d.name AS name
         """
-        try:
-            result = await run_cypher(q, {"name": safe_query})
-        except Exception:
-            return {"name": safe_query, "doEat": [], "noEat": [], "recommandEat": []}
+        result = []
+        effective_query = safe_query
+        for candidate in _alias_candidates(safe_query):
+            try:
+                result = await run_cypher(q, {"name": candidate})
+            except Exception:
+                result = []
+            if result:
+                effective_query = candidate
+                break
 
         if not result:
             return {"name": safe_query, "doEat": [], "noEat": [], "recommandEat": []}
 
-        info = {"name": safe_query}
+        info = {"name": effective_query}
 
-        # 合并查询：宜吃、忌吃、推荐食物
+        # 合并查询：宜吃、忌吃、推荐食物（基于实际命中的疾病名）
         combined_q = """
         MATCH (d:Disease {name: $name})
         OPTIONAL MATCH (d)-[:do_eat]->(f1:Food)
@@ -937,7 +1026,7 @@ async def food_contraindication(query: str, type: str = "food"):
           collect(DISTINCT f3.name) AS recommandEat
         """
         try:
-            cr = await run_cypher(combined_q, {"name": safe_query})
+            cr = await run_cypher(combined_q, {"name": effective_query})
             if cr:
                 r = cr[0]
                 info["doEat"] = (r["doEat"] or [])[:20]
@@ -1025,27 +1114,35 @@ async def guide_department(query: str):
     LIMIT 5
     """
     try:
-        results = await run_cypher(q, {"query": safe_query})
+        # 别名归一化：候选按序尝试（规范名优先、原词兜底）；每个候选先按疾病名匹配，
+        # 未命中再按症状名匹配（保持既有两级降级逻辑），命中即返回（最多4次查询）
+        results = []
+        for candidate in _alias_candidates(safe_query):
+            try:
+                results = await run_cypher(q, {"query": candidate})
+            except Exception:
+                results = []
+            if not results or not results[0].get("name"):
+                # 查症状关联的疾病对应的科室（第二级降级）
+                q2 = """
+                MATCH (s:Symptom)<-[:has_symptom]-(d:Disease)-[:belongs_to]->(dep:Department)
+                WHERE s.name CONTAINS $query
+                WITH DISTINCT dep
+                OPTIONAL MATCH (d2:Disease)-[:belongs_to]->(dep)
+                OPTIONAL MATCH (d2)-[:need_check]->(c:Check)
+                RETURN dep.name AS name,
+                  collect(DISTINCT d2.name) AS diseases,
+                  collect(DISTINCT c.name) AS checks
+                LIMIT 5
+                """
+                try:
+                    results = await run_cypher(q2, {"query": candidate})
+                except Exception:
+                    results = []
+            if results and results[0].get("name"):
+                break
     except Exception:
         results = []
-
-    if not results or not results[0].get("name"):
-        # 查症状关联的疾病对应的科室
-        q2 = """
-        MATCH (s:Symptom)<-[:has_symptom]-(d:Disease)-[:belongs_to]->(dep:Department)
-        WHERE s.name CONTAINS $query
-        WITH DISTINCT dep
-        OPTIONAL MATCH (d2:Disease)-[:belongs_to]->(dep)
-        OPTIONAL MATCH (d2)-[:need_check]->(c:Check)
-        RETURN dep.name AS name,
-          collect(DISTINCT d2.name) AS diseases,
-          collect(DISTINCT c.name) AS checks
-        LIMIT 5
-        """
-        try:
-            results = await run_cypher(q2, {"query": safe_query})
-        except Exception:
-            results = []
 
     departments = []
     for r in results:
@@ -1073,23 +1170,28 @@ async def guide_check(query: str):
     MATCH (c:Check {name: $name})
     RETURN c.name AS name, properties(c) AS props
     """
-    try:
-        results = await run_cypher(q, {"name": safe_query})
-    except Exception:
-        results = []
-
-    if not results:
-        # 模糊搜索
-        fuzzy_q = """
-        MATCH (c:Check)
-        WHERE c.name CONTAINS $name
-        RETURN c.name AS name, properties(c) AS props
-        LIMIT 1
-        """
+    fuzzy_q = """
+    MATCH (c:Check)
+    WHERE c.name CONTAINS $name
+    RETURN c.name AS name, properties(c) AS props
+    LIMIT 1
+    """
+    # 别名归一化：候选按序尝试（规范名优先、原词兜底），每个候选先精确后模糊；
+    # 全部未命中保持既有 404 契约（最多4次查询）
+    results = []
+    for candidate in _alias_candidates(safe_query):
         try:
-            results = await run_cypher(fuzzy_q, {"name": safe_query})
+            results = await run_cypher(q, {"name": candidate})
         except Exception:
-            pass
+            results = []
+        if not results:
+            # 模糊搜索（保持既有降级逻辑）
+            try:
+                results = await run_cypher(fuzzy_q, {"name": candidate})
+            except Exception:
+                results = []
+        if results:
+            break
 
     if not results:
         raise HTTPException(status_code=404, detail="未找到该检查项目")
