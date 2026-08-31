@@ -131,6 +131,12 @@ function getRiskGlow(risk) {
         <span class="card-header-title">用药安全与禁忌查询</span>
       </div>
 
+      <!-- Disclaimer（前置到查询结果展示区上方，保障用药提示优先可见） -->
+      <div class="mt-4 flex items-start gap-3 p-4 glass-card text-sm text-surface-500">
+        <el-icon class="mt-0.5 flex-shrink-0 text-surface-400"><InfoFilled /></el-icon>
+        <p><strong>免责声明：</strong>以上用药信息仅供参考，具体用药请遵医嘱。如有不适请及时就医。</p>
+      </div>
+
       <div class="p-5">
         <el-tabs v-model="activeTab">
           <!-- Drug contraindication -->
@@ -315,12 +321,6 @@ function getRiskGlow(risk) {
           </el-tab-pane>
         </el-tabs>
       </div>
-    </div>
-
-    <!-- Disclaimer -->
-    <div class="mt-4 flex items-start gap-3 p-4 glass-card text-sm text-surface-500">
-      <el-icon class="mt-0.5 flex-shrink-0 text-surface-400"><InfoFilled /></el-icon>
-      <p><strong>免责声明：</strong>以上用药信息仅供参考，具体用药请遵医嘱。如有不适请及时就医。</p>
     </div>
   </div>
 </template>

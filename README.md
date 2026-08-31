@@ -58,7 +58,7 @@
 | **后端框架** | FastAPI | 异步高性能，自动生成 API 文档 |
 | **图数据库** | Neo4j 5.26 社区版 | 存储 4.4 万实体 + 30 万关系 |
 | **AI 模型** | DeepSeek Chat | 流式输出，支持上下文对话 |
-| **认证方案** | JWT + bcrypt | 7 天有效期令牌，bcrypt 密码加密 |
+| **认证方案** | JWT + bcrypt | 30 分钟 access token + 7 天 refresh token，登出即失效；密码哈希加固（超长密码先 sha256 再 bcrypt） |
 | **环境配置** | python-dotenv | `.env` 文件管理敏感配置 |
 
 ### 2.3 数据模型
@@ -97,8 +97,9 @@
 
 ### 3.1 用户认证与健康档案
 
-- **注册/登录**：用户名唯一校验、邮箱格式验证、密码强度校验（8 位以上含字母数字）、bcrypt 加密存储
-- **JWT 认证**：7 天有效期令牌，路由守卫自动拦截未登录请求
+- **注册/登录**：用户名唯一校验、邮箱格式验证、密码强度校验（8 位以上含字母数字）、密码哈希加固存储（超长密码先 sha256 摘要再 bcrypt，旧哈希登录时静默升级）
+- **JWT 认证**：30 分钟 access token + 7 天 refresh token，前端 401 时自动单飞刷新并重放请求；登出即时失效（jti 黑名单 + token_version 版本校验），路由守卫自动拦截未登录请求；登录/注册与问答接口均带滑动窗口限流（429 + Retry-After）
+- **数据主权**：支持一键导出个人全部数据（`/api/user/export`）与彻底删除账号及数据（`/api/user/data`）；健康档案敏感字段（过敏史/病史/家族史）落盘前 Fernet 加密，读出时解密
 - **健康档案**：支持维护年龄、性别、身高、体重、血型、过敏史（药品/食物）、既往病史、家族病史、生活习惯
 - **个性化联动**：问答和推荐功能自动带入匿名化档案信息
 
@@ -292,7 +293,7 @@ QASystemOnMedicalKG-master/
 |-------|------|------|
 | N+1 查询修复 | `get_entity_detail` 5次→1次、`diagnosis` 21次→1次 | 大幅减少 Neo4j 查询次数 |
 | 异步化 | `run_cypher` 使用 `asyncio.to_thread` 包装 | 避免阻塞 FastAPI 事件循环 |
-| 内存缓存 | 实体详情、总数等高频查询 5 分钟 TTL 缓存 | 减少重复数据库查询 |
+| 内存缓存 | 实体总数 5 分钟 TTL 缓存 | 减少重复数据库查询 |
 | Neo4j 连接池 | `max_connection_pool_size=50` | 提升并发能力 |
 | 安全加固 | 移除硬编码密钥，改用 `.env` + `python-dotenv` | 防止密钥泄露 |
 | 错误处理 | `bare except` → `except Exception` + logging | 便于问题排查 |
@@ -329,11 +330,12 @@ cd backend
 # 安装 Python 依赖
 pip install -r requirements.txt
 
-# 配置环境变量（创建 .env 文件）
-# .env 内容示例：
-# DEEPSEEK_API_KEY=sk-your-api-key-here
+# 配置环境变量（创建 .env 文件，可参考 .env.example）
+# 以下为启动必填项，缺失或为弱值时后端拒绝启动：
+# DEEPSEEK_API_KEY=sk-your-api-key-here（未配置时 AI 问答降级）
 # NEO4J_PASSWORD=your-neo4j-password
-# JWT_SECRET=your-jwt-secret
+# JWT_SECRET=（>=32 位强随机值，生成：python -c "import secrets; print(secrets.token_urlsafe(32))"）
+# PROFILE_ENCRYPTION_KEY=（档案敏感字段加密密钥，生成：python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"）
 
 # 启动后端服务
 python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload
@@ -370,8 +372,12 @@ npm run build
 
 | 模块 | 接口 | 方法 | 说明 |
 |------|------|------|------|
-| **认证** | `/api/auth/register` | POST | 用户注册 |
-| | `/api/auth/login` | POST | 用户登录，返回 JWT |
+| **认证** | `/api/auth/register` | POST | 用户注册（限流） |
+| | `/api/auth/login` | POST | 用户登录，返回 access/refresh 双令牌（限流） |
+| | `/api/auth/refresh` | POST | 刷新令牌轮换签发新令牌对 |
+| | `/api/auth/logout` | POST | 登出，令牌即时失效 |
+| **账户** | `/api/user/export` | GET | 导出当前用户全部数据 |
+| | `/api/user/data` | DELETE | 删除账号及全部数据 |
 | **档案** | `/api/profile/get` | GET | 获取健康档案 |
 | | `/api/profile/update` | POST | 更新健康档案 |
 | **图谱** | `/api/kg/entities` | GET | 搜索实体（支持类型/关键词/分页） |
@@ -419,9 +425,11 @@ npm run build
 
 ### 9.3 安全设计
 
-- 密码 bcrypt 加密存储，禁止明文传输
-- JWT 令牌 7 天有效期，路由守卫自动拦截
-- Cypher 注入防护：输入参数过滤 `;`、`//`、`DROP`、`DELETE` 等危险字符
+- 密码哈希加固存储（超长密码先 sha256 摘要再 bcrypt，`v2$` 前缀，存量哈希兼容并登录时静默升级），禁止明文传输
+- JWT 双令牌：30 分钟 access token + 7 天 refresh token，前端 401 自动单飞刷新重放；登出即时失效（进程内 jti 黑名单 + token_version 版本校验）；启动时强校验 JWT_SECRET（缺失/过短/弱值拒启）
+- Cypher 注入防护：全量参数化查询 + 实体标签白名单（ALLOWED_LABELS）+ 输入长度校验（已移除可能误伤合法输入的关键词黑名单）
+- 登录/注册与 AI 问答接口滑动窗口限流（429 + Retry-After）
+- 健康档案敏感字段（过敏史/病史/家族史）落盘前 Fernet 加密，读路径统一解密输出；JSON 文件原子写入（临时文件 + os.replace）
 - CORS 白名单限制，仅允许指定前端域名访问
 - API 密钥通过 `.env` 管理，`.gitignore` 防止泄露
 - Markdown 渲染使用 DOMPurify 防 XSS

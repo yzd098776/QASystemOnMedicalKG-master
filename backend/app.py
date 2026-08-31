@@ -4,6 +4,7 @@
 """
 
 import os
+import sys
 import json
 import time
 import asyncio
@@ -46,6 +47,8 @@ from core.security import (
 )
 # 内存滑动窗口限流（详见 core/ratelimit.py）
 from core.ratelimit import check_rate_limit
+# 健康档案敏感字段加密（详见 core/crypto.py）
+from core.crypto import encrypt_field, decrypt_field, get_cipher, has_ciphertext
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -117,8 +120,17 @@ def load_json(path: str) -> dict:
 
 
 def save_json(path: str, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
+    """原子写：先写同目录临时文件，再 os.replace 覆盖目标文件，
+    避免写入中断时损坏原文件"""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+async def save_json_async(path: str, data: dict):
+    """异步包装：阻塞的文件写入放入线程池执行，不阻塞事件循环"""
+    await asyncio.to_thread(save_json, path, data)
 
 
 users_db = load_json(USERS_FILE)
@@ -127,6 +139,54 @@ health_records_db = load_json(HEALTH_RECORDS_FILE)
 health_plans_db = load_json(HEALTH_PLANS_FILE)
 chat_history_db = load_json(CHAT_HISTORY_FILE)
 chat_sessions = {}
+
+# 健康档案敏感字段集合（过敏史/病史/家族史）：落盘前统一加密，读出时统一解密输出明文，
+# 响应契约保持不变
+SENSITIVE_PROFILE_FIELDS = {"allergy_drug", "allergy_food", "medical_history", "family_history"}
+
+
+def _decrypted_profile(username: str) -> dict:
+    """读取用户健康档案并解密敏感字段后返回（读路径统一出口）"""
+    profile = profiles_db.get(username, {})
+    return {
+        k: (decrypt_field(v) if k in SENSITIVE_PROFILE_FIELDS else v)
+        for k, v in profile.items()
+    }
+
+
+def _startup_crypto_check():
+    """启动自检：profiles.json 中已存在密文但未配置加密密钥时拒绝启动，
+    否则存量加密数据将无法解密"""
+    if get_cipher() is not None:
+        return
+    for profile in profiles_db.values():
+        if any(has_ciphertext(profile.get(f)) for f in SENSITIVE_PROFILE_FIELDS):
+            print(
+                "[配置错误] profiles.json 中已存在加密数据，但未配置 PROFILE_ENCRYPTION_KEY，"
+                "无法解密。请在 backend/.env 中配置原密钥后重启。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+
+def _migrate_profile_ciphertext():
+    """存量迁移：已配置加密密钥时，把 profiles 中仍为明文的敏感字段自动加密回写"""
+    if get_cipher() is None:
+        return
+    changed = False
+    for profile in profiles_db.values():
+        for field in SENSITIVE_PROFILE_FIELDS:
+            value = profile.get(field)
+            if isinstance(value, str) and value and not has_ciphertext(value):
+                profile[field] = encrypt_field(value)
+                changed = True
+    if changed:
+        save_json(PROFILES_FILE, profiles_db)
+        logger.info("健康档案敏感字段存量加密迁移完成")
+
+
+_startup_crypto_check()
+_migrate_profile_ciphertext()
 
 
 # ========== Pydantic 模型 ==========
@@ -271,7 +331,7 @@ async def register(req: RegisterRequest, request: Request):
         "token_version": 0,
         "created_at": datetime.now().isoformat(),
     }
-    save_json(USERS_FILE, users_db)
+    await save_json_async(USERS_FILE, users_db)
     return {"message": "注册成功"}
 
 
@@ -287,7 +347,7 @@ async def login(req: LoginRequest, request: Request):
     # 旧格式密码哈希登录成功后静默升级回写，存量用户无感知
     if needs_rehash(user["password"]):
         user["password"] = hash_password(req.password)
-        save_json(USERS_FILE, users_db)
+        await save_json_async(USERS_FILE, users_db)
     # 签发双令牌：access（30分钟）+ refresh（7天）；保留原 token/user 字段，
     # 新增 refresh_token 与 expires_in（秒）字段，不破坏既有响应契约
     token_version = user.get("token_version", 0)
@@ -333,20 +393,26 @@ async def logout(request: Request):
     revoke_jti(payload.get("jti"), payload.get("exp"))
     user = users_db[username]
     user["token_version"] = user.get("token_version", 0) + 1
-    save_json(USERS_FILE, users_db)
+    await save_json_async(USERS_FILE, users_db)
     return {"message": "已登出"}
 
 
 # ========== 健康档案接口 ==========
 @app.get("/api/profile/get")
 async def get_profile(username: str = Depends(get_current_user)):
-    return profiles_db.get(username, {})
+    # 敏感字段解密后以明文输出，响应契约不变
+    return _decrypted_profile(username)
 
 
 @app.post("/api/profile/update")
 async def update_profile(profile: ProfileUpdate, username: str = Depends(get_current_user)):
-    profiles_db[username] = profile.model_dump(exclude_none=True)
-    save_json(PROFILES_FILE, profiles_db)
+    data = profile.model_dump(exclude_none=True)
+    # 落盘前加密敏感字段（非空时）；未配置加密密钥时 encrypt_field 原样返回明文
+    for field in SENSITIVE_PROFILE_FIELDS:
+        if data.get(field):
+            data[field] = encrypt_field(data[field])
+    profiles_db[username] = data
+    await save_json_async(PROFILES_FILE, profiles_db)
     return {"message": "健康档案已更新"}
 
 
@@ -999,7 +1065,8 @@ async def guide_check(query: str):
 # ========== 健康管理接口 ==========
 @app.post("/api/health/prevention")
 async def health_prevention(request: Request, username: str = Depends(get_current_user)):
-    profile = profiles_db.get(username, {})
+    # 档案敏感字段解密后读取；请求体中自带的 profile 为前端传入的明文，直接使用
+    profile = _decrypted_profile(username)
     body = await request.json()
     profile = body.get("profile") or profile
 
@@ -1093,7 +1160,8 @@ async def health_prevention(request: Request, username: str = Depends(get_curren
 async def health_chronic(request: Request, username: str = Depends(get_current_user)):
     body = await request.json()
     disease = body.get("disease", "")
-    profile = body.get("profile") or profiles_db.get(username, {})
+    # 档案敏感字段解密后读取；请求体中自带的 profile 为前端传入的明文，直接使用
+    profile = body.get("profile") or _decrypted_profile(username)
 
     age = profile.get("age", "未知")
     gender = profile.get("gender", "未知")
@@ -1180,7 +1248,7 @@ async def get_health_records(username: str = Depends(get_current_user)):
             r["_id"] = f"{r.get('date', 'unknown')}_{i}_{int(time.time() * 1000)}"
             changed = True
     if changed:
-        save_json(HEALTH_RECORDS_FILE, health_records_db)
+        await save_json_async(HEALTH_RECORDS_FILE, health_records_db)
     return {"records": records}
 
 
@@ -1193,7 +1261,7 @@ async def save_health_record(record: HealthRecord, username: str = Depends(get_c
     health_records_db[username].append(rec)
     # 按日期排序
     health_records_db[username].sort(key=lambda x: x["date"], reverse=True)
-    save_json(HEALTH_RECORDS_FILE, health_records_db)
+    await save_json_async(HEALTH_RECORDS_FILE, health_records_db)
     return {"message": "记录已保存"}
 
 
@@ -1207,7 +1275,7 @@ async def delete_health_record(record_id: str, username: str = Depends(get_curre
     if len(new_records) == len(records):
         raise HTTPException(status_code=404, detail="未找到该记录")
     health_records_db[username] = new_records
-    save_json(HEALTH_RECORDS_FILE, health_records_db)
+    await save_json_async(HEALTH_RECORDS_FILE, health_records_db)
     return {"message": "记录已删除"}
 
 
@@ -1235,14 +1303,14 @@ async def save_health_plan(request: Request, username: str = Depends(get_current
     if username not in health_plans_db:
         health_plans_db[username] = []
     health_plans_db[username].insert(0, plan)
-    save_json(HEALTH_PLANS_FILE, health_plans_db)
+    await save_json_async(HEALTH_PLANS_FILE, health_plans_db)
     return {"message": "计划已保存", "plan": plan}
 
 
 @app.delete("/api/health/plans")
 async def clear_health_plans(username: str = Depends(get_current_user)):
     health_plans_db[username] = []
-    save_json(HEALTH_PLANS_FILE, health_plans_db)
+    await save_json_async(HEALTH_PLANS_FILE, health_plans_db)
     return {"message": "所有计划已清空"}
 
 
@@ -1297,9 +1365,9 @@ async def chat(req: ChatRequest, request: Request, username: str = Depends(optio
     # 构建消息
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # 添加健康档案上下文
+    # 添加健康档案上下文（敏感字段解密后使用）
     if username and username in profiles_db:
-        profile = profiles_db[username]
+        profile = _decrypted_profile(username)
         parts = []
         if profile.get("age"):
             parts.append(f"{profile['age']}岁")
@@ -1488,7 +1556,7 @@ async def save_chat_history(req: SaveChatRequest, username: str = Depends(get_cu
                 "name": req.session_name,
                 "messages": [m.model_dump() for m in req.messages],
             }
-            save_json(CHAT_HISTORY_FILE, chat_history_db)
+            await save_json_async(CHAT_HISTORY_FILE, chat_history_db)
             return {"ok": True}
 
     # 新会话，追加到头部
@@ -1497,7 +1565,7 @@ async def save_chat_history(req: SaveChatRequest, username: str = Depends(get_cu
         "name": req.session_name,
         "messages": [m.model_dump() for m in req.messages],
     })
-    save_json(CHAT_HISTORY_FILE, chat_history_db)
+    await save_json_async(CHAT_HISTORY_FILE, chat_history_db)
     return {"ok": True}
 
 
@@ -1505,8 +1573,46 @@ async def save_chat_history(req: SaveChatRequest, username: str = Depends(get_cu
 async def clear_chat_history(username: str = Depends(get_current_user)):
     """一键清除当前用户所有聊天记录"""
     chat_history_db[username] = {"sessions": []}
-    save_json(CHAT_HISTORY_FILE, chat_history_db)
+    await save_json_async(CHAT_HISTORY_FILE, chat_history_db)
     return {"ok": True}
+
+
+# ========== 用户数据导出与彻底删除 ==========
+@app.get("/api/user/export")
+async def export_user_data(username: str = Depends(get_current_user)):
+    """聚合导出当前用户全部数据：账户信息（不含密码字段）、健康档案（解密后）、
+    健康记录、健康计划、聊天记录；缺失处给空对象/空数组"""
+    user_info = {
+        k: v for k, v in users_db.get(username, {}).items() if k != "password"
+    }
+    return {
+        "username": username,
+        "user": user_info,
+        "profile": _decrypted_profile(username),
+        "health_records": health_records_db.get(username, []),
+        "health_plans": health_plans_db.get(username, []),
+        "chat_history": chat_history_db.get(username, {"sessions": []}),
+    }
+
+
+@app.delete("/api/user/data")
+async def delete_user_data(username: str = Depends(get_current_user)):
+    """删除账号及该用户在五处存储中的全部数据并回写文件；
+    删除前 token_version 自增，使存量令牌全部失效"""
+    user = users_db.get(username)
+    if user:
+        user["token_version"] = user.get("token_version", 0) + 1
+    users_db.pop(username, None)
+    profiles_db.pop(username, None)
+    health_records_db.pop(username, None)
+    health_plans_db.pop(username, None)
+    chat_history_db.pop(username, None)
+    await save_json_async(USERS_FILE, users_db)
+    await save_json_async(PROFILES_FILE, profiles_db)
+    await save_json_async(HEALTH_RECORDS_FILE, health_records_db)
+    await save_json_async(HEALTH_PLANS_FILE, health_plans_db)
+    await save_json_async(CHAT_HISTORY_FILE, chat_history_db)
+    return {"message": "账号及全部数据已删除"}
 
 
 # ========== 启动 ==========
