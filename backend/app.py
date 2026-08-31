@@ -50,6 +50,8 @@ from core.security import (
 from core.ratelimit import check_rate_limit
 # 健康档案敏感字段加密（详见 core/crypto.py）
 from core.crypto import encrypt_field, decrypt_field, get_cipher, has_ciphertext
+# 图谱索引/唯一约束幂等检查（阶段二，详见 core/graph_index.py）
+from core.graph_index import ensure_graph_indexes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -334,6 +336,16 @@ async def lifespan(app: FastAPI):
         print("[OK] Neo4j connected successfully")
     except Exception as e:
         print(f"[FAIL] Neo4j connection failed: {e}")
+    # 启动时幂等地检查/建立七类实体的 name 索引与唯一约束（阶段二）：
+    # 全部为 IF NOT EXISTS 幂等语句，重名标签自动降级为普通索引；
+    # 失败仅告警不阻断启动，保证接口可用性优先
+    try:
+        def _sync_runner(cypher, params=None):
+            return _run_cypher_sync(cypher, params)
+
+        await asyncio.to_thread(ensure_graph_indexes, _sync_runner)
+    except Exception as e:
+        logger.warning(f"启动时图谱索引/约束检查失败（不阻断启动）: {e}")
     yield
     # 关闭时清理
     if driver:

@@ -3,16 +3,49 @@
 # File: MedicalGraph.py
 # Author: lhy<lhy_in_blcu@126.com,https://huangyong.github.io>
 # Date: 18-10-3
+#
+# 阶段二加固：
+# 1) 数据库密码不再硬编码：优先读环境变量 NEO4J_PASSWORD（自动加载 backend/.env），
+#    未提供时显式报错退出，避免使用弱密码兜底；
+# 2) 建图前先执行幂等的索引/约束检查（core.graph_index.ensure_graph_indexes）；
+# 3) 新增 --index-only 参数：只建索引/约束不导入数据；
+# 4) 关系创建改为参数化 Cypher（原先 % 字符串拼接存在注入与转义隐患）。
+#    注意：唯一约束建立后原脚本的重复建节点/建边行为会被数据库拒绝，
+#    属于预期的幂等保护（重跑不产生重复数据）。
 
-import os
+import argparse
 import json
-from py2neo import Graph,Node
+import logging
+import os
+import sys
+
+from py2neo import Graph, Node
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("build_medicalgraph")
+
+# 复用后端集中配置：先加载 backend/.env 再做安全校验（未配置 NEO4J_PASSWORD 时拒绝运行）
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend"))
+from core.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD  # noqa: E402
+from core.graph_index import ensure_graph_indexes  # noqa: E402
+
 
 class MedicalGraph:
     def __init__(self):
-        cur_dir = '/'.join(os.path.abspath(__file__).split('/')[:-1])
+        cur_dir = os.path.dirname(os.path.abspath(__file__))
         self.data_path = os.path.join(cur_dir, 'data/medical.json')
-        self.g = Graph("bolt://localhost:7687", auth=("neo4j", "12345678"))
+        # 连接信息统一来自环境变量（经 core.config 加载校验），不再硬编码密码；
+        # NEO4J_PASSWORD 未配置时 core.config 已直接报错退出，不会走到这里
+        self.g = Graph(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+
+    '''建图前幂等地建立索引/唯一约束（重名标签自动降级为普通索引并告警）'''
+    def ensure_indexes(self):
+        def _runner(cypher, params=None):
+            # py2neo 的 run 返回游标，统一转为 dict 列表，满足 ensure_graph_indexes 约定
+            return [dict(record) for record in self.g.run(cypher, params or {})]
+
+        logger.info("开始检查/建立图谱索引与唯一约束（幂等）...")
+        return ensure_graph_indexes(_runner)
 
     '''读取文件'''
     def read_nodes(self):
@@ -216,18 +249,23 @@ class MedicalGraph:
         for edge in edges:
             set_edges.append('###'.join(edge))
         all = len(set(set_edges))
+        # 标签为脚本内固定白名单值（非外部输入），以花括号模板拼接；
+        # 实体名与关系名改为参数化传入，替代原先的 % 字符串拼接（防注入/转义加固）
+        query = (
+            "match(p:%s),(q:%s) where p.name=$p and q.name=$q "
+            "create (p)-[rel:%s{name:$rel_name}]->(q)" % (start_node, end_node, rel_type)
+        )
         for edge in set(set_edges):
             edge = edge.split('###')
             p = edge[0]
             q = edge[1]
-            query = "match(p:%s),(q:%s) where p.name='%s'and q.name='%s' create (p)-[rel:%s{name:'%s'}]->(q)" % (
-                start_node, end_node, p, q, rel_type, rel_name)
             try:
-                self.g.run(query)
+                self.g.run(query, {"p": p, "q": q, "rel_name": rel_name})
                 count += 1
                 print(rel_type, count, all)
             except Exception as e:
-                print(e)
+                # 已存在唯一约束时重复建边会被拒绝，属幂等保护的预期行为，仅提示
+                print(rel_type, 'skip:', p, q, str(e)[:120])
         return
 
     '''导出数据'''
@@ -262,9 +300,26 @@ class MedicalGraph:
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="医疗知识图谱建图脚本")
+    parser.add_argument(
+        "--index-only", action="store_true",
+        help="只检查/建立索引与唯一约束，不导入数据",
+    )
+    args = parser.parse_args()
+
     handler = MedicalGraph()
+    # 建图流程开始前先执行幂等的索引/约束检查（失败仅告警不阻断导入）
+    try:
+        handler.ensure_indexes()
+    except Exception as e:
+        logger.warning("索引/约束检查失败（不阻断建图）: %s", e)
+
+    if args.index_only:
+        print("--index-only：索引/约束检查完成，跳过数据导入")
+        sys.exit(0)
+
     print("step1:导入图谱节点中")
     handler.create_graphnodes()
-    print("step2:导入图谱边中")      
+    print("step2:导入图谱边中")
     handler.create_graphrels()
     
