@@ -13,6 +13,7 @@
 - **大模型集成**：接入 DeepSeek API，实现流式输出的智能问答
 - **6 大特色功能**：疾病自查、用药安全、健康计划、就医指南、知识百科、健康档案
 - **全面性能优化**：ECharts 按需引入、后端 N+1 查询修复、异步化、缓存层等
+- **数据质量与图谱能力增强（阶段二）**：索引/唯一约束自动建立、口语别名归一化、图谱幂等迁移（外部编码占位、关系属性补全、疾病先验、症状 IDF）、先验加权诊断
 
 ---
 
@@ -91,6 +92,18 @@
 | drugs_of | 在售厂商 | 药品→生产商 |
 | - | 症状→疾病 | 反向查询 |
 
+**阶段二新增属性与索引（由幂等迁移/启动自检维护，只增不删）：**
+
+| 项目 | 说明 |
+|------|------|
+| `Disease.icd10` | ICD-10 编码，当前为 `""` 占位（无权威来源，待对齐后回填，不编造） |
+| `Drug.atc` | ATC 编码，当前为 `""` 占位（同上） |
+| `Disease.get_prob` | 疾病患病先验（百分比数值），源自 `data/medical.json` 的 `get_prob` 字段 |
+| `Symptom.idf` | 症状逆文档频率 `log(1+总疾病数/关联疾病数)`，越常见的症状权重越低 |
+| 六类疾病关系属性 | `has_symptom / common_drug / do_eat / no_eat / need_check / acompany_with` 补齐 `weight`（默认 1.0）、`source`（默认 `"medical.json"`）、`evidence_level`（默认 `"unverified"`，默认值含义见迁移脚本注释） |
+| 索引/约束 | 七类实体标签的 `name` 唯一约束（存在重名的标签自动降级普通索引并告警），后端启动与建图脚本均幂等执行 |
+| 别名归一化 | `backend/data/aliases.json` 收录 27 条口语别名→规范实体名映射（如 感冒→上呼吸道感染、拉肚子→腹泻），图谱查询类接口统一先归一化再查询，未命中原词兜底再查 |
+
 ---
 
 ## 三、核心功能
@@ -128,8 +141,8 @@
 ### 3.4 多症状疾病自查
 
 - **症状选择器**：按 8 大系统分类（呼吸/消化/神经/心血管/运动/皮肤/泌尿/全身）
-- **多选支持**：支持添加症状持续时间和严重程度
-- **智能推理**：基于 `has_symptom` 关系计算症状重合度，按概率排序
+- **多选支持**：支持添加症状持续时间和严重程度，输入症状先经别名归一化（如「发烧」→规范症状）
+- **智能推理**：匹配分 = Σ命中症状的 IDF 权重（越常见的症状权重越低）+ 疾病先验阻尼项 `log(1+get_prob)`，按分数降序排序；结果新增 `match_evidence`（每条命中症状的权重与贡献分）与 `prior` 字段，`probability` 归一化为 0-100 相对置信度（既有响应字段均保留）
 - **结果展示**：疾病名称、匹配症状、简介、建议检查、推荐科室
 - **一键咨询**：自查结果自动带入问答系统
 
@@ -174,8 +187,18 @@ QASystemOnMedicalKG-master/
 │
 ├── backend/                            # FastAPI 后端
 │   ├── app.py                          # 全部 API 接口（认证/图谱/问答/自查/用药/健康）
-│   ├── .env                            # 环境变量（DEEPSEEK_API_KEY 等）
+│   ├── .env                            # 环境变量（DEEPSEEK_API_KEY 等，不入库）
 │   ├── requirements.txt                # Python 依赖
+│   ├── core/                           # 核心模块
+│   │   ├── config.py                   # 配置加载与强校验（.env）
+│   │   ├── security.py / crypto.py     # 认证与档案字段加密（阶段一）
+│   │   ├── ratelimit.py                # 滑动窗口限流（阶段一）
+│   │   ├── graph_index.py              # 七类标签索引/唯一约束幂等检查（阶段二）
+│   │   └── alias.py                    # 口语别名归一化（阶段二）
+│   ├── data/
+│   │   └── aliases.json                # 别名→规范实体名词典（阶段二）
+│   ├── scripts/
+│   │   └── migrate_graph_phase2.py     # 图谱幂等迁移脚本（阶段二，可独立重跑）
 │   ├── users.json                      # 用户数据持久化
 │   ├── profiles.json                   # 健康档案持久化
 │   ├── health_records.json             # 健康日历记录持久化
@@ -298,6 +321,9 @@ QASystemOnMedicalKG-master/
 | 安全加固 | 移除硬编码密钥，改用 `.env` + `python-dotenv` | 防止密钥泄露 |
 | 错误处理 | `bare except` → `except Exception` + logging | 便于问题排查 |
 | 时间修复 | `datetime.utcnow()` → `datetime.now(timezone.utc)` | 消除时区警告 |
+| 索引与约束 | 七类实体 `name` 唯一约束（重名自动降级普通索引），启动/建图时幂等执行 | 查询提速且防重复实体 |
+| 别名归一化 | 口语别名统一映射到规范实体名后查询，未命中原词兜底 | 提升召回率，避免 0 召回 |
+| 诊断加权 | 症状 IDF + 疾病先验阻尼加权替代简单重合度计数 | 常见病与心血管等关键疾病排序更合理 |
 
 ---
 
@@ -315,12 +341,24 @@ QASystemOnMedicalKG-master/
 ### 7.2 Neo4j 数据库
 
 1. 安装并启动 Neo4j 5.x，访问 `http://localhost:7474`
-2. 默认连接信息：`bolt://localhost:7687`，用户名 `neo4j`，密码 `12345678`
-3. 导入数据：
+2. 默认连接地址：`bolt://localhost:7687`，用户名 `neo4j`；密码不再硬编码，统一通过环境变量/`.env` 提供（建图脚本读取 `backend/.env` 的 `NEO4J_PASSWORD`，未配置时报错退出）
+3. 导入数据（建图前自动幂等创建索引/约束）：
 
 ```bash
 python build_medicalgraph.py
+
+# 仅创建/校验索引与约束，不导入数据（幂等，可重复执行）
+python build_medicalgraph.py --index-only
 ```
+
+4. 存量图谱迁移（幂等、只增不删，可安全重跑；补齐外部编码占位、关系属性、疾病先验与症状 IDF）：
+
+```bash
+cd backend
+python scripts/migrate_graph_phase2.py
+```
+
+脚本会打印每一步受影响行数与最终汇总；重复执行时占位与关系属性步骤应显示 0 行。
 
 ### 7.3 后端配置与启动
 
@@ -384,7 +422,7 @@ npm run build
 | | `/api/kg/entity/{name}` | GET | 实体详情（含关联症状/药品/食物/检查） |
 | | `/api/kg/path` | GET | 最短路径查询 |
 | | `/api/kg/related` | GET | 关联实体查询（支持深度） |
-| **自查** | `/api/diagnosis` | POST | 多症状疾病匹配 |
+| **自查** | `/api/diagnosis` | POST | 多症状疾病匹配（症状 IDF + 先验加权，结果含 `match_evidence`/`prior`） |
 | **用药** | `/api/drug/contraindication` | GET | 药品禁忌查询 |
 | | `/api/food/contraindication` | GET | 食物-疾病禁忌查询 |
 | | `/api/drug/interaction` | POST | 药物相互作用查询 |
@@ -447,6 +485,9 @@ npm run build
 | DeepSeek API | 需自行申请 API 密钥，未配置时使用降级模式 |
 | PDF 导出 | 健康档案 PDF 导出功能为前端占位，需集成 jsPDF |
 | 知识图谱更新 | 当前为静态数据导入，不支持实时更新 |
+| 外部编码缺失 | `Disease.icd10`、`Drug.atc` 当前为空串占位，待权威数据源对齐后回填 |
+| 先验数据质量 | 语料 `get_prob` 量纲混杂（0~100，含特定人群发病率），诊断先验采用对数阻尼降低其影响，后续需规范化先验来源 |
+| 症状覆盖缺口 | 部分症状组合（如发烧+咳嗽）在图谱中无疾病同时关联两症状，影响排序上限，受数据本身限制不做伪造 |
 
 ### 10.2 未来规划
 
