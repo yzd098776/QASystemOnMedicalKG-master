@@ -261,7 +261,8 @@ QASystemOnMedicalKG-master/
 ├── build_medicalgraph.py               # Neo4j 数据导入脚本
 │
 ├── backend/                            # FastAPI 后端
-│   ├── app.py                          # 路由编排 + 应用装配（lifespan、CORS、请求ID中间件、/health）
+│   ├── app.py                          # 应用装配薄壳（logging/CORS/请求ID中间件/lifespan//health/include_router）
+│   ├── routers/                        # 路由层：8 个 APIRouter（auth/user/kg/diagnosis/drug/guide/health/chat），阶段五物理拆分，路径前缀不变
 │   ├── schemas.py                      # 请求体模型层（阶段五：自 app.py 抽出）
 │   ├── deps.py                         # 共享依赖层（认证依赖、输入校验、别名候选、跨标签定位、缓存薄封装）
 │   ├── store.py                        # 数据仓储层（五处 JSON 的加载/原子落盘、档案加解密、启动自检/迁移）
