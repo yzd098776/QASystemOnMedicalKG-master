@@ -8,10 +8,12 @@ import sys
 import json
 import math
 import time
+import uuid
 import asyncio
 import logging
 import tempfile
 import traceback
+import contextvars
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 from contextlib import asynccontextmanager
@@ -60,7 +62,46 @@ from services.diagnosis_service import run_diagnosis
 from services.drug_service import run_drug_interaction, run_drug_contraindication
 from services.vector_index import ensure_vector_indexes
 
+# ========== 结构化日志与请求 ID（阶段五） ==========
+# 每个请求绑定唯一 request_id（透传上游 X-Request-ID 或新生成），经 contextvar
+# 贯穿整条调用链，日志以 JSON 行输出，便于按请求 ID 串联一次请求的全部日志。
+_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+
+
+class _RequestIdFilter(logging.Filter):
+    """把当前上下文 request_id 注入日志记录"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_var.get()
+        return True
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """结构化日志：一行一条 JSON，含时间/级别/logger/请求ID/消息（异常含堆栈）"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "rid": getattr(record, "request_id", "-"),
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
 logging.basicConfig(level=logging.INFO)
+_root_logger = logging.getLogger()
+_json_fmt = _JsonLogFormatter()
+_rid_filter = _RequestIdFilter()
+for _h in _root_logger.handlers:
+    _h.setFormatter(_json_fmt)
+    _h.addFilter(_rid_filter)
+# 降噪：neo4j 驱动通知与 httpx 访问日志（阶段三/四已依赖，INFO 级刷屏）仅保留 WARNING+
+logging.getLogger("neo4j").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 if not DEEPSEEK_API_KEY:
@@ -368,6 +409,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """为每个请求分配/透传 X-Request-ID，绑定到日志上下文（contextvar），
+    回写响应头并记录一条访问日志；同一次请求的所有日志共享同一 rid，便于串联排查。"""
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
+    token = _request_id_var.set(rid)
+    start = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        # 无论成功/异常都记录访问耗时并复位上下文（异常路径交回 FastAPI 生成 500）
+        dur_ms = (time.perf_counter() - start) * 1000
+        logging.getLogger("access").info(
+            "%s %s -> %s (%.0fms)", request.method, request.url.path, status, dur_ms
+        )
+        _request_id_var.reset(token)
+
+
+@app.get("/health")
+async def health():
+    """运维探活（无认证）：验证进程存活与 Neo4j 可达（RETURN 1）；DB 不可达返回 503。"""
+    try:
+        await run_cypher("RETURN 1 AS ok")
+    except Exception as e:
+        logger.warning("健康检查失败：Neo4j 不可达: %s", e)
+        raise HTTPException(status_code=503, detail="数据库不可达")
+    return {"status": "ok", "database": "up"}
 
 
 # ========== 用户认证接口 ==========

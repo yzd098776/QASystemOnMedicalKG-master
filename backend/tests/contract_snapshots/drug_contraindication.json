@@ -1,0 +1,10 @@
+{
+  "body": {
+    "contra": [],
+    "disease": "str",
+    "name": "str",
+    "noEat": [],
+    "producer": "str"
+  },
+  "status": 200
+}

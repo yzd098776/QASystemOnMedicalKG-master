@@ -1,0 +1,4 @@
+# 开发/测试依赖（生产运行时依赖见 requirements.txt）
+-r requirements.txt
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

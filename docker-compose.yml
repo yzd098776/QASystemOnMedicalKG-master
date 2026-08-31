@@ -1,0 +1,55 @@
+# 医疗知识图谱系统 一体化部署（阶段五）
+# 一条命令启动：先复制 .env.example 为 .env 填入 NEO4J_PASSWORD / JWT_SECRET 等，
+# 再 `docker compose up -d --build`。首次启动 backend 会自动导入 47MB medical.json
+# 建图、执行阶段二迁移与阶段三向量索引（幂等：检测到已有数据则跳过）。
+services:
+  neo4j:
+    image: neo4j:5.26
+    ports:
+      - "7474:7474"   # HTTP 浏览器
+      - "7687:7687"   # Bolt
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?请在 .env 设置 NEO4J_PASSWORD}
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env
+    environment:
+      NEO4J_URI: bolt://neo4j:7687   # 容器内以服务名访问 neo4j
+    ports:
+      - "8000:8000"
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # 可选 Redis：启用多 worker 共享缓存时取消注释，并在 .env 设 REDIS_URL=redis://redis:6379/0
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
+
+volumes:
+  neo4j-data:

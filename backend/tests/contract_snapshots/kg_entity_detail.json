@@ -1,0 +1,36 @@
+{
+  "body": {
+    "checks": [
+      "str"
+    ],
+    "drugs": [
+      "str"
+    ],
+    "foods": [
+      "str"
+    ],
+    "label": "str",
+    "name": "str",
+    "properties": {
+      "cause": "str",
+      "cure_department": [
+        "str"
+      ],
+      "cure_lasttime": "str",
+      "cure_way": [
+        "str"
+      ],
+      "cured_prob": "str",
+      "desc": "str",
+      "easy_get": "str",
+      "get_prob": "float",
+      "icd10": "str",
+      "name": "str",
+      "prevent": "str"
+    },
+    "symptoms": [
+      "str"
+    ]
+  },
+  "status": 200
+}

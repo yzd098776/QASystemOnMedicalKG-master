@@ -1,0 +1,15 @@
+{
+  "body": {
+    "links": [],
+    "next_cursor": "NoneType",
+    "nodes": [
+      {
+        "desc": "str",
+        "label": "str",
+        "name": "str"
+      }
+    ],
+    "total": "int"
+  },
+  "status": 200
+}

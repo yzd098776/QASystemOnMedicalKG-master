@@ -1,0 +1,8 @@
+{
+  "body": {
+    "category": "str",
+    "content": "str",
+    "title": "str"
+  },
+  "status": 200
+}

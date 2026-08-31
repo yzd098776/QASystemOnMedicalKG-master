@@ -482,6 +482,27 @@ npm run build
 
 ---
 
+### 7.6 容器化一键部署（阶段五）
+
+仓库根提供 `docker-compose.yml`，一条命令拉起 Neo4j + 后端 + 前端：
+
+```bash
+cp backend/.env.example .env   # 至少填 NEO4J_PASSWORD、JWT_SECRET（PROFILE_ENCRYPTION_KEY 可选）
+docker compose up -d --build
+```
+
+- 首次启动时后端 `entrypoint.sh` 自动等待 Neo4j → 导入 47MB `data/medical.json` 建图 → 执行阶段二迁移与阶段三向量索引（幂等：检测到已有数据即跳过）；数据经 `neo4j-data` 卷持久化，二次启动秒级拉起。
+- 前端 http://localhost:8080（Nginx 托管静态资源并反代 `/api` 到后端，已对 SSE 关闭缓冲）；API http://localhost:8000；探活 `GET /health`。
+- 需要多 worker 共享缓存时：取消 compose 中 `redis` 服务注释并在 `.env` 设 `REDIS_URL=redis://redis:6379/0`。
+- 镜像以仓库根为 build context（详见 `.dockerignore`；`backend/.env` 不入镜像，运行期由 `env_file` 注入）。
+
+### 7.7 测试与 CI（阶段五）
+
+- **契约测试**（`tests/test_contract.py`）：对全部 `/api` 路由录制「状态码 + 响应字段形状」签名基线（`tests/contract_snapshots/`），只锁结构与状态码、不锁业务数据值，分层重构后运行即可捕获任何对外契约漂移。重录基线：`CONTRACT_RECORD=1 python -m pytest tests/test_contract.py`。
+- **关键逻辑回归**（`tests/test_core.py`）：疾病自查加权（matchedCount 不越界、按分降序）、药物相互作用结构、Cypher 注入防护（参数化 + 非白名单标签返回空）、Text2Cypher 写子句拒绝、认证双令牌登录/刷新/登出失效端到端。
+- 本地运行：`pip install -r backend/requirements-dev.txt`，确保本地 Neo4j 有数据（或经 docker 起库导入）后 `cd backend; python -m pytest tests/`。
+- CI（`.github/workflows/ci.yml`）：起 Neo4j 5.26 服务容器 → `build_medicalgraph.py` + 阶段二迁移灌数据 → `compileall` + `ruff` 静态检查 → `pytest` 全套。
+
 ## 八、API 接口一览
 
 | 模块 | 接口 | 方法 | 说明 |

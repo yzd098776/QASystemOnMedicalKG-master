@@ -1,0 +1,18 @@
+{
+  "body": {
+    "detail": [
+      {
+        "ctx": {
+          "min_length": "int"
+        },
+        "input": "str",
+        "loc": [
+          "str"
+        ],
+        "msg": "str",
+        "type": "str"
+      }
+    ]
+  },
+  "status": 422
+}

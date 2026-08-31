@@ -1,0 +1,30 @@
+{
+  "body": {
+    "results": [
+      {
+        "checks": [
+          "str"
+        ],
+        "department": [
+          "str"
+        ],
+        "desc": "str",
+        "match_evidence": [
+          {
+            "contribution": "float",
+            "symptom": "str",
+            "weight": "float"
+          }
+        ],
+        "matchedCount": "int",
+        "matchedSymptoms": [
+          "str"
+        ],
+        "name": "str",
+        "prior": "float",
+        "probability": "int"
+      }
+    ]
+  },
+  "status": 200
+}

@@ -1,0 +1,17 @@
+{
+  "body": {
+    "departments": [
+      {
+        "checks": [
+          "str"
+        ],
+        "description": "str",
+        "diseases": [
+          "str"
+        ],
+        "name": "str"
+      }
+    ]
+  },
+  "status": 200
+}

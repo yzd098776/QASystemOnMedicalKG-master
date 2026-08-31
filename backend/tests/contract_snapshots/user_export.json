@@ -1,0 +1,13 @@
+{
+  "body": {
+    "chat_history": {
+      "sessions": []
+    },
+    "health_plans": [],
+    "health_records": [],
+    "profile": {},
+    "user": {},
+    "username": "str"
+  },
+  "status": 200
+}

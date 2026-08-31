@@ -1,0 +1,13 @@
+{
+  "body": {
+    "interactions": [
+      {
+        "description": "str",
+        "drug1": "str",
+        "drug2": "str",
+        "risk": "str"
+      }
+    ]
+  },
+  "status": 200
+}

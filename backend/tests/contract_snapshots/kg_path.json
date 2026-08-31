@@ -1,0 +1,16 @@
+{
+  "body": {
+    "paths": [
+      {
+        "description": "str",
+        "edges": [
+          "str"
+        ],
+        "nodes": [
+          "str"
+        ]
+      }
+    ]
+  },
+  "status": 200
+}

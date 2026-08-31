@@ -1,0 +1,18 @@
+{
+  "body": {
+    "links": [
+      {
+        "relType": "str",
+        "source": "str",
+        "target": "str"
+      }
+    ],
+    "nodes": [
+      {
+        "label": "str",
+        "name": "str"
+      }
+    ]
+  },
+  "status": 200
+}

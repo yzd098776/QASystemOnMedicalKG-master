@@ -1,0 +1,25 @@
+# 构建上下文精简（backend/frontend 镜像均以仓库根为 context）
+.git
+.github
+**/__pycache__
+**/*.pyc
+**/*.pyo
+.pytest_cache
+
+# 敏感配置不进镜像（运行期由 compose env_file 注入）
+backend/.env
+
+# 前端构建产物与依赖由镜像内重新生成
+frontend/node_modules
+frontend/dist
+
+# 运行时用户数据（容器内为全新空库，数据经 neo4j-data 卷持久化）
+backend/users.json
+backend/profiles.json
+backend/health_records.json
+backend/health_plans.json
+backend/chat_history.json
+
+# 交接/过程文档
+HANDOFF.md
+CLAUDE.md

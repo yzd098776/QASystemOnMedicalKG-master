@@ -1,0 +1,7 @@
+{
+  "body": {
+    "database": "str",
+    "status": "str"
+  },
+  "status": 200
+}
