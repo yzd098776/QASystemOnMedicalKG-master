@@ -5,14 +5,9 @@
 
 import os
 import json
-from dotenv import load_dotenv
-
-load_dotenv()
 import time
-import hashlib
 import asyncio
 import logging
-import secrets
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
@@ -23,53 +18,40 @@ from fastapi import FastAPI, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, EmailStr
-from jose import JWTError, jwt
-import bcrypt
 import httpx
 from neo4j import GraphDatabase
+
+# 集中配置：导入时先加载 backend/.env，再校验 JWT_SECRET 等强安全项，校验失败拒启；
+# 必须在读取任何环境变量之前导入，保证加载顺序正确
+from core.config import (
+    NEO4J_URI,
+    NEO4J_USER,
+    NEO4J_PASSWORD,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_API_URL,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+    RATE_LIMIT_AUTH_PER_MINUTE,
+    RATE_LIMIT_CHAT_PER_MINUTE,
+)
+# 安全工具：双令牌签发/校验、jti 黑名单、密码哈希加固（详见 core/security.py）
+from core.security import (
+    create_token,
+    decode_token,
+    hash_password,
+    verify_password,
+    needs_rehash,
+    revoke_jti,
+    is_revoked,
+    validate_access_payload,
+)
+# 内存滑动窗口限流（详见 core/ratelimit.py）
+from core.ratelimit import check_rate_limit
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== 配置 ==========
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com/v1/chat/completions")
-SECRET_KEY = os.getenv("JWT_SECRET") or secrets.token_hex(32)
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_DAYS = 7
-
 if not DEEPSEEK_API_KEY:
     logger.warning("DEEPSEEK_API_KEY 未设置，AI问答将使用模拟响应")
-if not NEO4J_PASSWORD:
-    logger.warning("NEO4J_PASSWORD 未设置，将使用默认密码")
-    NEO4J_PASSWORD = "12345678"
-
-# ========== 密码与JWT ==========
-
-
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode('utf-8'), hashed.encode('utf-8'))
-
-
-def create_token(data: dict) -> str:
-    to_encode = data.copy()
-    expire = datetime.now(timezone.utc) + timedelta(days=ACCESS_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def decode_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(status_code=401, detail="无效的认证令牌")
 
 
 # ========== Neo4j 连接 ==========
@@ -159,6 +141,10 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
 class ProfileUpdate(BaseModel):
     age: Optional[int] = None
     gender: Optional[str] = None
@@ -202,16 +188,25 @@ class HealthRecord(BaseModel):
 
 
 # ========== 认证中间件 ==========
-def get_current_user(request: Request) -> str:
+def _extract_bearer(request: Request) -> str:
+    """从 Authorization 头提取 Bearer 令牌，缺失时 401"""
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="未提供认证令牌")
-    token = auth[7:]
-    payload = decode_token(token)
-    username = payload.get("sub")
-    if not username or username not in users_db:
-        raise HTTPException(status_code=401, detail="用户不存在")
-    return username
+    return auth[7:]
+
+
+def get_current_user(request: Request) -> str:
+    # 校验链：签名/有效期 -> 用户存在 -> type=access -> jti 黑名单 -> token_version 一致性
+    payload = decode_token(_extract_bearer(request))
+    return validate_access_payload(payload, users_db)
+
+
+def _current_payload(request: Request) -> dict:
+    """解码并完整校验 Bearer 令牌，返回载荷（供登出等需要 jti/exp 的接口使用）"""
+    payload = decode_token(_extract_bearer(request))
+    validate_access_payload(payload, users_db)
+    return payload
 
 
 def optional_user(request: Request) -> Optional[str]:
@@ -219,10 +214,10 @@ def optional_user(request: Request) -> Optional[str]:
     if not auth.startswith("Bearer "):
         return None
     try:
-        token = auth[7:]
-        payload = decode_token(token)
-        return payload.get("sub")
-    except Exception:
+        payload = decode_token(auth[7:])
+        # 同样走黑名单与 token_version 校验，失效令牌视为匿名访问
+        return validate_access_payload(payload, users_db)
+    except HTTPException:
         return None
 
 
@@ -259,7 +254,11 @@ app.add_middleware(
 
 # ========== 用户认证接口 ==========
 @app.post("/api/auth/register")
-async def register(req: RegisterRequest):
+async def register(req: RegisterRequest, request: Request):
+    # 限流：IP + 用户名双维度，防止批量注册攻击（超限抛 429）
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit("auth-ip", client_ip, RATE_LIMIT_AUTH_PER_MINUTE)
+    check_rate_limit("auth-user", req.username, RATE_LIMIT_AUTH_PER_MINUTE)
     if req.username in users_db:
         raise HTTPException(status_code=400, detail="用户名已存在")
     for u in users_db.values():
@@ -269,6 +268,7 @@ async def register(req: RegisterRequest):
         "username": req.username,
         "email": req.email,
         "password": hash_password(req.password),
+        "token_version": 0,
         "created_at": datetime.now().isoformat(),
     }
     save_json(USERS_FILE, users_db)
@@ -276,15 +276,65 @@ async def register(req: RegisterRequest):
 
 
 @app.post("/api/auth/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    # 限流：IP + 用户名双维度，防止暴力破解密码（超限抛 429）
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit("auth-ip", client_ip, RATE_LIMIT_AUTH_PER_MINUTE)
+    check_rate_limit("auth-user", req.username, RATE_LIMIT_AUTH_PER_MINUTE)
     user = users_db.get(req.username)
     if not user or not verify_password(req.password, user["password"]):
         raise HTTPException(status_code=401, detail="用户名或密码错误")
-    token = create_token({"sub": req.username})
+    # 旧格式密码哈希登录成功后静默升级回写，存量用户无感知
+    if needs_rehash(user["password"]):
+        user["password"] = hash_password(req.password)
+        save_json(USERS_FILE, users_db)
+    # 签发双令牌：access（30分钟）+ refresh（7天）；保留原 token/user 字段，
+    # 新增 refresh_token 与 expires_in（秒）字段，不破坏既有响应契约
+    token_version = user.get("token_version", 0)
+    token = create_token(req.username, "access", extra={"token_version": token_version})
+    refresh_token = create_token(req.username, "refresh", extra={"token_version": token_version})
     return {
         "token": token,
         "user": {"username": req.username, "email": user["email"]},
+        "refresh_token": refresh_token,
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     }
+
+
+@app.post("/api/auth/refresh")
+async def refresh(req: RefreshRequest):
+    """使用 refresh token 轮换签发新的 access + refresh 令牌"""
+    payload = decode_token(req.refresh_token)
+    # type 缺失视为 access（兼容旧令牌），而此处只接受 refresh 类型
+    if payload.get("type", "access") != "refresh":
+        raise HTTPException(status_code=401, detail="无效的刷新令牌")
+    username = payload.get("sub")
+    user = users_db.get(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    jti = payload.get("jti")
+    if jti and is_revoked(jti):
+        raise HTTPException(status_code=401, detail="刷新令牌已失效，请重新登录")
+    if payload.get("token_version", 0) != user.get("token_version", 0):
+        raise HTTPException(status_code=401, detail="令牌已失效，请重新登录")
+    # 轮换：旧 refresh 的 jti 加入黑名单，防止重复使用；再签发新令牌对
+    revoke_jti(jti, payload.get("exp"))
+    token_version = user.get("token_version", 0)
+    token = create_token(username, "access", extra={"token_version": token_version})
+    refresh_token = create_token(username, "refresh", extra={"token_version": token_version})
+    return {"token": token, "refresh_token": refresh_token}
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request):
+    """登出：当前 access 的 jti 入黑名单 + 用户 token_version 自增，使存量令牌全部失效"""
+    payload = _current_payload(request)
+    username = payload["sub"]
+    revoke_jti(payload.get("jti"), payload.get("exp"))
+    user = users_db[username]
+    user["token_version"] = user.get("token_version", 0) + 1
+    save_json(USERS_FILE, users_db)
+    return {"message": "已登出"}
 
 
 # ========== 健康档案接口 ==========
@@ -1238,7 +1288,12 @@ SYSTEM_PROMPT = """你是一个专业的医疗健康助手，必须优先使用�
 
 
 @app.post("/api/chat")
-async def chat(req: ChatRequest, username: str = Depends(optional_user)):
+async def chat(req: ChatRequest, request: Request, username: str = Depends(optional_user)):
+    # 限流：IP + 登录用户（可选）双维度，防止滥用大模型接口（超限抛 429）
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit("chat-ip", client_ip, RATE_LIMIT_CHAT_PER_MINUTE)
+    if username:
+        check_rate_limit("chat-user", username, RATE_LIMIT_CHAT_PER_MINUTE)
     # 构建消息
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 

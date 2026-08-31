@@ -2,7 +2,7 @@
 import { ref, reactive, computed, nextTick, onMounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useUserStore } from '@/stores/index'
-import request from '@/utils/request'
+import request, { refreshAuth } from '@/utils/request'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
@@ -170,7 +170,10 @@ async function sendMessage() {
     const controller = new AbortController()
     currentController.value = controller
 
-    const response = await fetch('/api/chat', {
+    // SSE 走原生 fetch，不经过 Axios 拦截器：
+    // 401 时若有 refresh_token 则先刷新令牌（复用 request.js 的单飞刷新）后重试一次；
+    // 429 / 其他非 200 给出明确中文错误提示（优先读响应 JSON 的 detail）
+    const doFetch = () => fetch('/api/chat', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -183,7 +186,40 @@ async function sendMessage() {
       signal: controller.signal,
     })
 
-    if (!response.ok) throw new Error('请求失败')
+    let response = await doFetch()
+    if (response.status === 401 && localStorage.getItem('refresh_token')) {
+      try {
+        await refreshAuth()
+        // 刷新成功：同步 store 中的新令牌，并用新令牌重试一次（仅一次）
+        userStore.setToken(localStorage.getItem('token'))
+        userStore.setRefreshToken(localStorage.getItem('refresh_token'))
+        response = await doFetch()
+      } catch {
+        // 刷新失败：保留原 401 响应，走下方登录过期分支（防死循环）
+      }
+    }
+
+    if (!response.ok) {
+      let detail = ''
+      try {
+        const errData = await response.json()
+        detail = errData && errData.detail ? errData.detail : ''
+      } catch {
+        // 错误响应体非 JSON 时忽略
+      }
+      if (response.status === 401) {
+        localStorage.removeItem('token')
+        localStorage.removeItem('refresh_token')
+        aiMessage.content = '登录已过期，请重新登录'
+        window.location.href = '/login'
+      } else if (response.status === 429) {
+        aiMessage.content = detail || '操作过于频繁，请稍后再试'
+        ElMessage.error(aiMessage.content)
+      } else {
+        aiMessage.content = detail || `请求失败（HTTP ${response.status}），请稍后再试`
+      }
+      return
+    }
 
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
