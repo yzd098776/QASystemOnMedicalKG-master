@@ -1,0 +1,133 @@
+@startuml medical_kg_model
+!pragma layout smetana
+
+title 医疗知识图谱属性图模型\nMedical Knowledge Graph — Property Graph Model
+
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam class {
+  BorderColor #FFFFFF
+  FontColor #FFFFFF
+  ArrowColor #4B5563
+  ArrowFontColor #4B5563
+  FontSize 13
+  AttributeFontSize 11
+  AttributeFontColor #FFFFFF
+  BorderThickness 2
+  RoundCorner 10
+}
+
+skinparam linetype polyline
+skinparam nodesep 60
+skinparam ranksep 50
+
+' ===== 实体定义 =====
+
+class "疾病 Disease" as Disease << (D, #E85D3A) >> {
+  name : String          // 疾病名称
+  description : String   // 疾病描述
+  cause : String         // 病因
+  prevention : String    // 预防方法
+  cure_rate : Float      // 治愈率
+  cost : String          // 治疗费用
+  contagious : Boolean   // 是否传染
+  hereditary : Boolean   // 是否遗传
+}
+
+class "药品 Drug" as Drug << (D, #0077CC) >> {
+  name : String          // 药品名称
+  generic_name : String  // 通用名
+  approval_no : String   // 批准文号
+  dosage_form : String   // 剂型
+  spec : String          // 规格
+  usage : String         // 用法用量
+  adverse_reaction : String  // 不良反应
+  storage : String       // 储存条件
+}
+
+class "症状 Symptom" as Symptom << (S, #00A878) >> {
+  name : String          // 症状名称
+  description : String   // 症状描述
+  body_part : String     // 所属部位
+  severity : String      // 严重程度
+}
+
+class "食物 Food" as Food << (F, #F59E0B) >> {
+  name : String          // 食物名称
+  nutrition : String     // 营养成分
+  calories : Float       // 热量(kcal)
+  suitable_for : String  // 适宜人群
+}
+
+class "检查 Check" as Check << (C, #8B5CF6) >> {
+  name : String          // 检查项目名称
+  description : String   // 检查说明
+  preparation : String   // 检查准备事项
+  cost_range : String    // 费用范围
+  department : String    // 所属科室
+}
+
+class "科室 Department" as Department << (DP, #F97316) >> {
+  name : String          // 科室名称
+  hospital : String      // 所属医院
+  description : String   // 科室简介
+}
+
+class "生产商 Manufacturer" as Manufacturer << (M, #6B7280) >> {
+  name : String          // 生产商名称
+  address : String       // 地址
+  contact : String       // 联系方式
+  license_no : String    // 生产许可证号
+}
+
+' ===== 关系定义 =====
+
+' 1. 疾病 --[常见症状]--> 症状
+Disease "1" --> "*" Symptom : 常见症状\nhas_symptom >
+
+' 2. 疾病 --[常用药品]--> 药品
+Disease "1" --> "*" Drug : 常用药品\nrecommend_drug >
+
+' 3. 疾病 --[需要检查]--> 检查
+Disease "1" --> "*" Check : 需要检查\nneed_check >
+
+' 4. 疾病 --[挂科科室]--> 科室
+Disease "1" --> "1" Department : 挂科科室\ngo_to_dept >
+
+' 5. 疾病 --[忌口食物]--> 食物
+Disease "1" --> "*" Food : 忌口食物\navoid_food >
+
+' 6. 疾病 --[推荐食物]--> 食物
+Disease "1" --> "*" Food : 推荐食物\nsuggest_food >
+
+' 7. 药品 --[药品相互作用]--> 药品
+Drug "1" --> "1" Drug : 相互作用\ndrug_interaction >
+
+' 8. 药品 --[食物禁忌]--> 食物
+Drug "1" --> "*" Food : 食物禁忌\nfood_taboo >
+
+' 9. 药品 --[生产商]--> 生产商
+Drug "*" --> "1" Manufacturer : 由…生产\nproduced_by >
+
+' 10. 症状 --[建议检查]--> 检查
+Symptom "1" --> "*" Check : 建议检查\nsuggest_check >
+
+' 11. 科室 --[常规检查]--> 检查
+Department "1" --> "*" Check : 常规检查\nroutine_check >
+
+' ===== 图例 =====
+
+legend bottom left
+  |= 类型 |= 颜色 |= 说明 |
+  | <#E85D3A> 疾病 | #E85D3A | 4.4万实体核心节点 |
+  | <#0077CC> 药品 | #0077CC | 西药/中成药/中草药 |
+  | <#00A878> 症状 | #00A878 | 临床表现 |
+  | <#F59E0B> 食物 | #F59E0B | 忌口/推荐食物 |
+  | <#8B5CF6> 检查 | #8B5CF6 | 医学检查项目 |
+  | <#F97316> 科室 | #F97316 | 医院科室 |
+  | <#6B7280> 生产商 | #6B7280 | 药品生产企业 |
+
+  **关系总计 11 类 · 约 30 万条**
+endlegend
+
+@enduml

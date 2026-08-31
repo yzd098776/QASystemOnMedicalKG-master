@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+frontend/dist/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Runtime user data / privacy-sensitive JSON
+backend/users.json
+backend/profiles.json
+backend/health_records.json
+backend/health_plans.json
+backend/chat_history.json
+
+# Local editor / OS / logs
+.claude/
+.vscode/
+.idea/
+.DS_Store
+*.log
