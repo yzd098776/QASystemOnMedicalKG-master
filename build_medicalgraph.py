@@ -10,8 +10,15 @@
 # 2) 建图前先执行幂等的索引/约束检查（core.graph_index.ensure_graph_indexes）；
 # 3) 新增 --index-only 参数：只建索引/约束不导入数据；
 # 4) 关系创建改为参数化 Cypher（原先 % 字符串拼接存在注入与转义隐患）。
-#    注意：唯一约束建立后原脚本的重复建节点/建边行为会被数据库拒绝，
-#    属于预期的幂等保护（重跑不产生重复数据）。
+#
+# 阶段三修复（建图幂等）：
+# 5) 节点与关系创建全部改为参数化 MERGE（原 g.create/CREATE 为 CREATE 语义）：
+#    - 节点 MERGE 以「标签 + name」为匹配键，其余属性仅在新建时写入（ON CREATE SET）；
+#    - 关系 MERGE 以「两端节点 + 关系类型」为匹配键，关系属性仅在新建时写入；
+#    - MERGE 命中已有节点/关系时直接匹配不新建，因此全新库首跑、存量库重跑均不会
+#      因唯一约束冲突而崩溃，也不会产生重复节点与重复边（真正的幂等保护机制，
+#      替代旧注释中“数据库拒绝=幂等保护”的错误说法——CREATE 遇约束只会抛异常中断）。
+#    注意：逐条 MERGE 在 30 万关系规模上较慢，属既有模式的已知取舍，本次不做批量化重构。
 
 import argparse
 import json
@@ -19,10 +26,18 @@ import logging
 import os
 import sys
 
-from py2neo import Graph, Node
+from py2neo import Graph
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("build_medicalgraph")
+
+# Windows 控制台默认 GBK 编码，建图过程大量中文实体名输出会触发 UnicodeEncodeError，
+# 统一把标准输出/错误流切换为 UTF-8（errors=replace 兜底，保证日志不中断建图）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 # 复用后端集中配置：先加载 backend/.env 再做安全校验（未配置 NEO4J_PASSWORD 时拒绝运行）
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "backend"))
@@ -184,26 +199,42 @@ class MedicalGraph:
                rels_check, rels_recommandeat, rels_noteat, rels_doeat, rels_department, rels_commonddrug, rels_drug_producer, rels_recommanddrug,\
                rels_symptom, rels_acompany, rels_category
 
-    '''建立节点'''
+    '''建立节点（幂等）：MERGE 以「标签+name」为匹配键，已存在则跳过不新建。
+    标签来自脚本内固定白名单调用（非外部输入），以花括号模板拼接；实体名参数化传入'''
     def create_node(self, label, nodes):
         count = 0
+        query = "MERGE (n:%s {name: $name})" % label
         for node_name in nodes:
-            node = Node(label, name=node_name)
-            self.g.create(node)
+            self.g.run(query, {"name": node_name})
             count += 1
             print(count, len(nodes))
         return
 
-    '''创建知识图谱中心疾病的节点'''
+    '''创建知识图谱中心疾病的节点（幂等）：MERGE 以 name 为匹配键，
+    其余属性只在新建节点时写入（ON CREATE SET），重跑不覆盖、不重复。
+    重名疾病（如「胎膜早破」语料中出现两次）第二次会命中同一节点而不新建，
+    因此无论是否存在唯一约束都不会崩溃'''
     def create_diseases_nodes(self, disease_infos):
         count = 0
+        query = (
+            "MERGE (n:Disease {name: $name}) "
+            "ON CREATE SET n.desc = $desc, n.prevent = $prevent, n.cause = $cause, "
+            "n.easy_get = $easy_get, n.cure_lasttime = $cure_lasttime, "
+            "n.cure_department = $cure_department, n.cure_way = $cure_way, "
+            "n.cured_prob = $cured_prob"
+        )
         for disease_dict in disease_infos:
-            node = Node("Disease", name=disease_dict['name'], desc=disease_dict['desc'],
-                        prevent=disease_dict['prevent'] ,cause=disease_dict['cause'],
-                        easy_get=disease_dict['easy_get'],cure_lasttime=disease_dict['cure_lasttime'],
-                        cure_department=disease_dict['cure_department']
-                        ,cure_way=disease_dict['cure_way'] , cured_prob=disease_dict['cured_prob'])
-            self.g.create(node)
+            self.g.run(query, {
+                "name": disease_dict['name'],
+                "desc": disease_dict['desc'],
+                "prevent": disease_dict['prevent'],
+                "cause": disease_dict['cause'],
+                "easy_get": disease_dict['easy_get'],
+                "cure_lasttime": disease_dict['cure_lasttime'],
+                "cure_department": disease_dict['cure_department'],
+                "cure_way": disease_dict['cure_way'],
+                "cured_prob": disease_dict['cured_prob'],
+            })
             count += 1
             print(count)
         return
@@ -241,7 +272,8 @@ class MedicalGraph:
         self.create_relationship('Disease', 'Disease', rels_acompany, 'acompany_with', '并发症')
         self.create_relationship('Disease', 'Department', rels_category, 'belongs_to', '所属科室')
 
-    '''创建实体关联边'''
+    '''创建实体关联边（幂等）：MERGE 以「两端节点 + 关系类型」为匹配键，
+    关系已存在则匹配不新建（不产生重复边），关系 name 属性仅在新建时写入'''
     def create_relationship(self, start_node, end_node, edges, rel_type, rel_name):
         count = 0
         # 去重处理
@@ -249,11 +281,13 @@ class MedicalGraph:
         for edge in edges:
             set_edges.append('###'.join(edge))
         all = len(set(set_edges))
-        # 标签为脚本内固定白名单值（非外部输入），以花括号模板拼接；
-        # 实体名与关系名改为参数化传入，替代原先的 % 字符串拼接（防注入/转义加固）
+        # 标签与关系类型为脚本内固定白名单值（非外部输入），以花括号模板拼接；
+        # 实体名与关系显示名改为参数化传入（防注入/转义加固）。
+        # 幂等机制说明：MERGE 命中「两端节点+关系类型」均已存在的边时直接匹配，
+        # 不会重复创建，也不依赖数据库约束拒绝（CREATE 遇约束只会抛异常中断，并非幂等保护）
         query = (
             "match(p:%s),(q:%s) where p.name=$p and q.name=$q "
-            "create (p)-[rel:%s{name:$rel_name}]->(q)" % (start_node, end_node, rel_type)
+            "merge (p)-[rel:%s]->(q) on create set rel.name=$rel_name" % (start_node, end_node, rel_type)
         )
         for edge in set(set_edges):
             edge = edge.split('###')
@@ -264,7 +298,8 @@ class MedicalGraph:
                 count += 1
                 print(rel_type, count, all)
             except Exception as e:
-                # 已存在唯一约束时重复建边会被拒绝，属幂等保护的预期行为，仅提示
+                # MERGE 语义下重复执行不会产生冲突，走到这里说明是连接异常等真实错误；
+                # 记录后跳过该边继续导入（重跑脚本可补齐），不再误报为“幂等保护”
                 print(rel_type, 'skip:', p, q, str(e)[:120])
         return
 
