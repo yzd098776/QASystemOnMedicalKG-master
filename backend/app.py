@@ -6,6 +6,7 @@
 import os
 import sys
 import json
+import math
 import time
 import asyncio
 import logging
@@ -822,6 +823,36 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, 
 
 
 # ========== 疾病自查接口 ==========
+async def _diagnosis_prior_context():
+    """诊断加权上下文（缓存5分钟）：全库疾病先验中位数 + 默认 IDF。
+    - 先验中位数：疾病 get_prob 缺失时的替代值（不伪造个体风险，避免一律归零）；
+    - 默认 IDF：症状缺失 idf（迁移未执行）时的兜底权重，取总疾病数对应的最大 IDF"""
+    cached = _cache_get("diag_prior_context", ttl=300)
+    if cached:
+        return cached
+    priors = []
+    try:
+        rows = await run_cypher(
+            "MATCH (d:Disease) WHERE d.get_prob IS NOT NULL RETURN d.get_prob AS p"
+        )
+        priors = sorted(float(r["p"]) for r in rows if r["p"] is not None)
+    except Exception as e:
+        logger.error(f"诊断先验中位数查询失败: {e}")
+    prior_median = priors[len(priors) // 2] if priors else 0.0
+    total_diseases = 0
+    try:
+        rows = await run_cypher("MATCH (d:Disease) RETURN count(d) AS c")
+        total_diseases = rows[0]["c"] if rows else 0
+    except Exception:
+        total_diseases = 0
+    ctx = {
+        "prior_median": prior_median,
+        "default_idf": math.log(1.0 + max(total_diseases, 1)),
+    }
+    _cache_set("diag_prior_context", ctx)
+    return ctx
+
+
 @app.post("/api/diagnosis")
 async def diagnosis(req: DiagnosisRequest):
     # 空症状项跳过（保持既有行为）；单个症状项超过200字符返回 400；
@@ -836,45 +867,109 @@ async def diagnosis(req: DiagnosisRequest):
     # 症状词别名归一化：把每个症状的规范名一并加入匹配集合（原词保留），
     # 提升口语化症状词的召回；匹配结果中返回的是图谱内实际命中的症状名，契约不变
 
-    # 查询所有包含这些症状的疾病及其症状、科室、检查（单次查询）
+    # ========== 加权诊断（阶段二） ==========
+    # 打分公式：score = Σ(命中症状的 IDF 权重) + log(1 + 疾病先验 get_prob)；
+    # 症状 IDF 语义：越常见的症状区分度越低、权重越低（由迁移脚本写入）；
+    # 先验采用 log(1+x) 阻尼叠加而非直接相乘：语料先验量纲混乱（0~100 混杂，
+    # 部分是“某人群中发病率”而非普通人群患病率），直接相乘会让个别离群先验（如 90%）
+    # 彻底淹没症状证据；对数叠加保证先验只作有限幅度的加成/排序微调，
+    # 命中症状的证据仍是排序主导因素；
+    # 疾病先验缺失时用全库疾病先验的中位数替代（不伪造风险，避免一律归零）；
+    # probability 保持数值型：把分数归一化到 0-100（最高分疾病为 100 的相对置信度），
+    # 替代旧版“命中症状数/输入症状数”口径；其余字段名与原契约完全一致，
+    # 新增 match_evidence（证据明细）与 prior（疾病先验）两个新增字段。
+    # 档案性别/年龄加权未启用：图谱疾病节点本身不含性别倾向字段，
+    # 且既有请求契约未接收年龄/性别参数（契约优先，不新增参数），故该项降级处理。
+    ctx = await _diagnosis_prior_context()
     query = """
     MATCH (d:Disease)-[:has_symptom]->(s:Symptom)
     WHERE s.name IN $symptoms
-    WITH d, collect(s.name) AS matchedSymptoms, count(s) AS matchCount
-    ORDER BY matchCount DESC
-    LIMIT 20
-    OPTIONAL MATCH (d)-[:need_check]->(c:Check)
+    WITH d, collect(DISTINCT {symptom: s.name, weight: coalesce(s.idf, $defaultIdf)}) AS evidence
     RETURN d.name AS name, d.desc AS desc, d.cure_department AS department,
-      matchedSymptoms, matchCount, collect(c.name) AS checks
+           evidence, d.get_prob AS prior
     """
     # 把每个症状的归一化名与原词都纳入匹配集合（去重保序），提升口语化症状词召回；
-    # 归一化名不存在时自然不命中，原词兜底召回不受影响，无需额外回查
+    # 归一化名不存在时自然不命中，原词兜底召回不受影响，无需额外回查；
+    # 症状缺失 IDF（迁移未执行）时用 $defaultIdf 兜底（总疾病数对应的最大 IDF）
     symptom_terms = []
     for s in symptoms:
         for term in (normalize_alias(s), s):
             if term not in symptom_terms:
                 symptom_terms.append(term)
     try:
-        results = await run_cypher(query, {"symptoms": symptom_terms})
+        results = await run_cypher(query, {"symptoms": symptom_terms, "defaultIdf": ctx["default_idf"]})
     except Exception as e:
         logger.error(f"诊断查询失败: {e}")
         return {"results": []}
 
-    total_input = len(symptoms)
-    diagnosis_results = []
+    # 逐疾病打分：基础分 = Σ命中症状 IDF 权重（未命中不计），再叠加阻尼后的疾病先验；
+    # 先验为百分比数值（如 0.00002 表示 0.00002%），仅作相对排序权重使用，
+    # 不代表临床概率；先验缺失/非数值时用中位数替代并注明降级口径；
+    # 先验贡献 = log(1 + max(prior, 0))，负值/异常值按 0 处理（对数域非负）
+    scored = []
     for r in results:
-        matched = r["matchedSymptoms"]
-        count = r["matchCount"]
-        probability = round((count / total_input) * 100) if total_input > 0 else 0
-
-        diagnosis_results.append({
+        evidence = r["evidence"] or []
+        base_score = sum(float(e["weight"]) for e in evidence)
+        prior_value = r["prior"]
+        if isinstance(prior_value, (int, float)):
+            prior_used = float(prior_value)
+        else:
+            prior_used = ctx["prior_median"]
+        prior_boost = math.log(1.0 + max(prior_used, 0.0))
+        score = base_score + prior_boost
+        scored.append({
             "name": r["name"],
             "desc": r["desc"] or "暂无简介",
-            "matchedSymptoms": matched,
-            "matchedCount": count,
-            "probability": probability,
             "department": r["department"] or "暂无",
-            "checks": (r["checks"] or [])[:5],
+            "evidence": evidence,
+            "prior_used": prior_used,
+            "prior_boost": prior_boost,
+            "prior": prior_value if isinstance(prior_value, (int, float)) else None,
+            "score": score,
+        })
+
+    # 按分数降序取前 20（与原接口 LIMIT 20 的数量上限一致）
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    top = scored[:20]
+
+    # 一次性批量查询头部疾病的检查项目（保持原 checks 字段，最多5项）
+    checks_map = {}
+    if top:
+        check_query = """
+        MATCH (d:Disease)-[:need_check]->(c:Check)
+        WHERE d.name IN $names
+        RETURN d.name AS name, collect(c.name) AS checks
+        """
+        try:
+            check_rows = await run_cypher(check_query, {"names": [t["name"] for t in top]})
+            for row in check_rows:
+                checks_map.setdefault(row["name"], []).extend(row["checks"] or [])
+        except Exception as e:
+            logger.error(f"诊断检查查询失败: {e}")
+
+    max_score = top[0]["score"] if top else 0.0
+    diagnosis_results = []
+    for t in top:
+        probability = round(t["score"] / max_score * 100) if max_score > 0 else 0
+        diagnosis_results.append({
+            "name": t["name"],
+            "desc": t["desc"],
+            "matchedSymptoms": [e["symptom"] for e in t["evidence"]],
+            "matchedCount": len(t["evidence"]),
+            "probability": probability,
+            "department": t["department"],
+            "checks": (checks_map.get(t["name"]) or [])[:5],
+            "prior": t["prior"],
+            "match_evidence": [
+                {
+                    "symptom": e["symptom"],
+                    "weight": round(float(e["weight"]), 4),
+                    # 单症状对基础分的贡献即其 IDF 权重（先验加成作用于疾病整体，
+                    # 不可拆分到单症状；未命中症状不计）
+                    "contribution": round(float(e["weight"]), 4),
+                }
+                for e in t["evidence"]
+            ],
         })
 
     return {"results": diagnosis_results}
