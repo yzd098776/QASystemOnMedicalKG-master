@@ -61,6 +61,24 @@ from services.rag_pipeline import run_graphrag_chat
 from services.diagnosis_service import run_diagnosis
 from services.drug_service import run_drug_interaction, run_drug_contraindication
 from services.vector_index import ensure_vector_indexes
+# 分层重构（阶段五）：模型 / 数据仓储 / 共享依赖抽至独立模块，app.py 专注装配与路由编排。
+# save_json_async / *_db / *_FILE / _decrypted_profile / SENSITIVE_PROFILE_FIELDS 来自 store；
+# 认证依赖与实体校验工具来自 deps；请求模型来自 schemas。
+from store import (
+    USERS_FILE, PROFILES_FILE, HEALTH_RECORDS_FILE, HEALTH_PLANS_FILE, CHAT_HISTORY_FILE,
+    users_db, profiles_db, health_records_db, health_plans_db, chat_history_db,
+    save_json_async, _decrypted_profile, SENSITIVE_PROFILE_FIELDS,
+)
+from deps import (
+    get_current_user, optional_user, _current_payload,
+    ALLOWED_LABELS, _validate_entity_input, _alias_candidates, _name_match_union,
+    _cache_get, _cache_set,
+)
+from schemas import (
+    RegisterRequest, LoginRequest, RefreshRequest, ProfileUpdate,
+    ChatMessage, ChatRequest, DiagnosisRequest, DrugInteractionRequest,
+    HealthRecord, ChatHistoryMessage, SaveChatRequest,
+)
 
 # ========== 结构化日志与请求 ID（阶段五） ==========
 # 每个请求绑定唯一 request_id（透传上游 X-Request-ID 或新生成），经 contextvar
@@ -122,238 +140,16 @@ from core.cache import (
     entity_cache_key,
     invalidate_user_caches,
 )
+# 注：_cache_get/_cache_set 薄封装已并入 deps（见顶部 import）；此处仅保留缓存底层依赖。
 
 
-def _cache_get(key: str, ttl: int = 300):
-    return _get_cache().get(key)
+# （用户数据仓储与持久化、启动期加密自检/迁移 已抽至 store.py，见顶部 import）
 
 
-def _cache_set(key: str, value, ttl: int = None):
-    _get_cache().set(key, value, ttl=ttl)
+# （请求体模型已抽至 schemas.py）
 
 
-# ========== 用户存储（内存 + JSON文件持久化） ==========
-USERS_FILE = os.path.join(os.path.dirname(__file__), "users.json")
-PROFILES_FILE = os.path.join(os.path.dirname(__file__), "profiles.json")
-HEALTH_RECORDS_FILE = os.path.join(os.path.dirname(__file__), "health_records.json")
-HEALTH_PLANS_FILE = os.path.join(os.path.dirname(__file__), "health_plans.json")
-CHAT_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "chat_history.json")
-
-
-def load_json(path: str) -> dict:
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"加载 {path} 失败: {e}")
-            return {}
-    return {}
-
-
-def save_json(path: str, payload: str):
-    """原子写：先写同目录的“唯一”临时文件，再 os.replace 覆盖目标文件。
-
-    竞态背景：本函数会被多个 asyncio.to_thread 线程并发调用（各写盘任务在
-    线程池中真并发执行）。若使用固定临时文件名（path + ".tmp"），两个线程
-    同时写同一临时文件会互相覆盖，产出损坏的 JSON；而 load_json 对损坏文件
-    只记日志并返回 {}，导致重启后数据被静默清空。因此这里必须用带随机后缀的
-    唯一临时文件名，保证各写任务互不干扰。
-    入参 payload 为调用方已在事件循环线程内序列化好的 JSON 字符串快照，
-    线程内不再触碰活字典，避免序列化期间字典被并发修改。
-    """
-    directory = os.path.dirname(os.path.abspath(path))
-    # mkstemp 生成同目录下带随机后缀的唯一临时文件，天然避免并发写同一临时文件；
-    # 以 fd 方式打开并立即关闭，避免 Windows 上临时文件被占用导致 os.replace 失败，
-    # 后续用普通方式按 UTF-8 重写内容（文件已以二进制独占模式创建）
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
-    os.close(fd)
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            f.write(payload)
-        # 写成功后原子替换目标文件。Windows 上临时文件刚关闭时可能被杀毒软件等
-        # 短暂占用，导致 os.replace 报 WinError 5（拒绝访问），故对替换操作做
-        # 短间隔有限重试；仍失败则走异常路径清理临时文件并抛出（原文件不受影响）
-        last_error = None
-        for _ in range(10):
-            try:
-                os.replace(tmp_path, path)
-                last_error = None
-                break
-            except PermissionError as e:
-                last_error = e
-                time.sleep(0.05)
-        if last_error is not None:
-            raise last_error
-    except OSError:
-        # 异常路径：清理残留临时文件后向上抛出，交由调用方感知（不吞异常）
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-async def save_json_async(path: str, data: dict):
-    """异步包装：阻塞的文件写入放入线程池执行，不阻塞事件循环。
-
-    快照策略：先在事件循环线程内执行 json.dumps 取得字符串快照——此时没有
-    其他协程并发修改字典（协程调度不会在同步语句中间切换），再把不可变的字符串
-    交给线程池写盘。若把活字典直接交给线程序列化，期间其他协程修改字典会触发
-    "dictionary changed size during iteration"，或写出前后不一致的快照。
-    """
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    await asyncio.to_thread(save_json, path, payload)
-
-
-users_db = load_json(USERS_FILE)
-profiles_db = load_json(PROFILES_FILE)
-health_records_db = load_json(HEALTH_RECORDS_FILE)
-health_plans_db = load_json(HEALTH_PLANS_FILE)
-chat_history_db = load_json(CHAT_HISTORY_FILE)
-chat_sessions = {}
-
-# 健康档案敏感字段集合（过敏史/病史/家族史）：落盘前统一加密，读出时统一解密输出明文，
-# 响应契约保持不变
-SENSITIVE_PROFILE_FIELDS = {"allergy_drug", "allergy_food", "medical_history", "family_history"}
-
-
-def _decrypted_profile(username: str) -> dict:
-    """读取用户健康档案并解密敏感字段后返回（读路径统一出口）"""
-    profile = profiles_db.get(username, {})
-    return {
-        k: (decrypt_field(v) if k in SENSITIVE_PROFILE_FIELDS else v)
-        for k, v in profile.items()
-    }
-
-
-def _startup_crypto_check():
-    """启动自检：profiles.json 中已存在密文但未配置加密密钥时拒绝启动，
-    否则存量加密数据将无法解密"""
-    if get_cipher() is not None:
-        return
-    for profile in profiles_db.values():
-        if any(has_ciphertext(profile.get(f)) for f in SENSITIVE_PROFILE_FIELDS):
-            print(
-                "[配置错误] profiles.json 中已存在加密数据，但未配置 PROFILE_ENCRYPTION_KEY，"
-                "无法解密。请在 backend/.env 中配置原密钥后重启。",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-
-def _migrate_profile_ciphertext():
-    """存量迁移：已配置加密密钥时，把 profiles 中仍为明文的敏感字段自动加密回写"""
-    if get_cipher() is None:
-        return
-    changed = False
-    for profile in profiles_db.values():
-        for field in SENSITIVE_PROFILE_FIELDS:
-            value = profile.get(field)
-            if isinstance(value, str) and value and not has_ciphertext(value):
-                profile[field] = encrypt_field(value)
-                changed = True
-    if changed:
-        # save_json 接收已序列化的 JSON 字符串：此处为启动期同步路径，
-        # 先在当前线程完成 dumps 快照再写盘，与异步路径的快照策略保持一致
-        save_json(PROFILES_FILE, json.dumps(profiles_db, ensure_ascii=False, indent=2))
-        logger.info("健康档案敏感字段存量加密迁移完成")
-
-
-_startup_crypto_check()
-_migrate_profile_ciphertext()
-
-
-# ========== Pydantic 模型 ==========
-class RegisterRequest(BaseModel):
-    username: str = Field(..., min_length=3, max_length=20)
-    email: str
-    password: str = Field(..., min_length=8)
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
-class RefreshRequest(BaseModel):
-    refresh_token: str
-
-
-class ProfileUpdate(BaseModel):
-    age: Optional[int] = None
-    gender: Optional[str] = None
-    height: Optional[float] = None
-    weight: Optional[float] = None
-    blood_type: Optional[str] = None
-    allergy_drug: Optional[str] = None
-    allergy_food: Optional[str] = None
-    medical_history: Optional[str] = None
-    family_history: Optional[str] = None
-    smoking: Optional[bool] = False
-    drinking: Optional[bool] = False
-
-
-class ChatMessage(BaseModel):
-    role: str
-    content: str
-
-
-class ChatRequest(BaseModel):
-    messages: List[ChatMessage]
-    context: Optional[str] = None
-
-
-class DiagnosisRequest(BaseModel):
-    symptoms: List[str]
-
-
-class DrugInteractionRequest(BaseModel):
-    drugs: List[str]
-
-
-class HealthRecord(BaseModel):
-    date: str
-    weight: Optional[float] = None
-    bloodPressureHigh: Optional[int] = None
-    bloodPressureLow: Optional[int] = None
-    bloodSugar: Optional[float] = None
-    heartRate: Optional[int] = None
-    note: Optional[str] = None
-
-
-# ========== 认证中间件 ==========
-def _extract_bearer(request: Request) -> str:
-    """从 Authorization 头提取 Bearer 令牌，缺失时 401"""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="未提供认证令牌")
-    return auth[7:]
-
-
-def get_current_user(request: Request) -> str:
-    # 校验链：签名/有效期 -> 用户存在 -> type=access -> jti 黑名单 -> token_version 一致性
-    payload = decode_token(_extract_bearer(request))
-    return validate_access_payload(payload, users_db)
-
-
-def _current_payload(request: Request) -> dict:
-    """解码并完整校验 Bearer 令牌，返回载荷（供登出等需要 jti/exp 的接口使用）"""
-    payload = decode_token(_extract_bearer(request))
-    validate_access_payload(payload, users_db)
-    return payload
-
-
-def optional_user(request: Request) -> Optional[str]:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return None
-    try:
-        payload = decode_token(auth[7:])
-        # 同样走黑名单与 token_version 校验，失效令牌视为匿名访问
-        return validate_access_payload(payload, users_db)
-    except HTTPException:
-        return None
+# （JWT 认证依赖 已抽至 deps.py）
 
 
 # ========== FastAPI 应用 ==========
@@ -552,62 +348,7 @@ async def update_profile(profile: ProfileUpdate, username: str = Depends(get_cur
 
 
 # ========== 知识图谱接口 ==========
-# 模块级实体标签白名单：Neo4j 节点标签不可参数化，只有该白名单内的标签才允许拼接进 Cypher；
-# 该白名单同时供后续 Text2Cypher 的白名单校验复用
-ALLOWED_LABELS = {"Disease", "Drug", "Symptom", "Food", "Check", "Department", "Producer"}
-
-
-def _validate_entity_input(value, name="参数"):
-    """轻量输入校验助手：
-    - 空值/纯空白返回 None，由调用方按各自契约返回空结果（保持原有“未命中返回空结构”行为）
-    - 长度超过 200 时返回 400，拦截明显异常输入
-    所有 Cypher 查询均以参数化方式传值，本身无注入风险，无需再做关键词黑名单过滤。
-    """
-    if value is None:
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    if len(value) > 200:
-        raise HTTPException(status_code=400, detail=f"{name}过长，请控制在200字符以内")
-    return value
-
-
-def _alias_candidates(value):
-    """构造别名归一化后的查询候选序列：归一化名优先，原词兜底。
-    各接入点按序尝试，命中即返回；全部未命中时由调用方按各自既有契约返回空结构。
-    传入 None 时返回 [None]（表示不带关键词查询）。
-    """
-    if value is None:
-        return [None]
-    normalized = normalize_alias(value)
-    if normalized and normalized != value:
-        return [normalized, value]
-    return [value]
-
-
-# 标签遍历固定顺序（字母序）：保证生成 Cypher 稳定，便于缓存查询计划与日志排查
-_LABEL_SCAN_ORDER = tuple(sorted(ALLOWED_LABELS))
-
-
-def _name_match_union(var: str, param: str) -> str:
-    """生成「按 name 跨七类实体标签查节点」的 CALL 子查询片段（含 CALL 包裹）。
-
-    背景（阶段三索引收益落地）：无标签 `MATCH (n {name:...})` 无法命中任何标签级
-    唯一约束/索引，PROFILE 实测为 AllNodesScan 全表扫描（~4.4 万 dbHits）。
-    曾尝试方案一：建 token-less 全局索引 `CREATE INDEX IF NOT EXISTS FOR (n) ON (n.name)`，
-    实测本库 Neo4j 5.26 不支持无标签属性索引语法（服务端 SyntaxError）；
-    故采用方案二：按 ALLOWED_LABELS 拆成逐标签分支（UNION ALL），每个分支带标签后
-    命中对应标签的约束/索引（NodeIndexSeek，约 2 dbHits/分支），整体降至两位数。
-    标签仅来自 ALLOWED_LABELS 白名单，name 值仍以 $参数传入，无注入风险。
-    CALL 使用空变量作用域子句 `CALL () { ... }`（Neo4j 5 推荐写法，避免弃用告警；
-    子查询只需 $参数、不导入外部变量，参数在子查询内天然可见）。
-    """
-    branches = [
-        "MATCH (%s:%s {name: $%s}) RETURN %s" % (var, label, param, var)
-        for label in _LABEL_SCAN_ORDER
-    ]
-    return "CALL () {\n" + "\nUNION ALL\n".join(branches) + "\n}"
+# （实体输入校验 / 标签白名单 / 别名候选 / 跨标签定位 Cypher 生成 已抽至 deps.py）
 
 
 @app.get("/api/kg/entities")
@@ -1673,17 +1414,7 @@ async def chat(req: ChatRequest, request: Request, username: str = Depends(optio
 
 # ========== 聊天记录存储 ==========
 
-class ChatHistoryMessage(BaseModel):
-    role: str
-    content: str
-    timestamp: Optional[str] = None
-
-
-class SaveChatRequest(BaseModel):
-    session_id: str
-    session_name: Optional[str] = "新对话"
-    messages: List[ChatHistoryMessage]
-
+# （聊天历史模型已抽至 schemas.py）
 
 @app.get("/api/chat/history")
 async def get_chat_history(username: str = Depends(get_current_user)):

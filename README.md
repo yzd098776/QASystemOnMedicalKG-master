@@ -261,24 +261,26 @@ QASystemOnMedicalKG-master/
 ├── build_medicalgraph.py               # Neo4j 数据导入脚本
 │
 ├── backend/                            # FastAPI 后端
-│   ├── app.py                          # 全部 API 接口（认证/图谱/问答/自查/用药/健康）
+│   ├── app.py                          # 路由编排 + 应用装配（lifespan、CORS、请求ID中间件、/health）
+│   ├── schemas.py                      # 请求体模型层（阶段五：自 app.py 抽出）
+│   ├── deps.py                         # 共享依赖层（认证依赖、输入校验、别名候选、跨标签定位、缓存薄封装）
+│   ├── store.py                        # 数据仓储层（五处 JSON 的加载/原子落盘、档案加解密、启动自检/迁移）
 │   ├── .env                            # 环境变量（DEEPSEEK_API_KEY 等，不入库）
-│   ├── requirements.txt                # Python 依赖
+│   ├── requirements.txt                # 运行时依赖
+│   ├── requirements-dev.txt            # 开发/测试依赖（pytest 等，阶段五）
+│   ├── Dockerfile / entrypoint.sh      # 后端镜像与「等库→导入→起服务」启动脚本（阶段五）
 │   ├── core/                           # 核心模块
 │   │   ├── config.py                   # 配置加载与强校验（.env）
 │   │   ├── security.py / crypto.py     # 认证与档案字段加密（阶段一）
 │   │   ├── ratelimit.py                # 滑动窗口限流（阶段一）
 │   │   ├── graph_index.py              # 七类标签索引/唯一约束幂等检查（阶段二）
-│   │   └── alias.py                    # 口语别名归一化（阶段二）
-│   ├── data/
-│   │   └── aliases.json                # 别名→规范实体名词典（阶段二）
-│   ├── scripts/
-│   │   └── migrate_graph_phase2.py     # 图谱幂等迁移脚本（阶段二，可独立重跑）
-│   ├── users.json                      # 用户数据持久化
-│   ├── profiles.json                   # 健康档案持久化
-│   ├── health_records.json             # 健康日历记录持久化
-│   ├── health_plans.json               # 健康计划历史持久化
-│   └── chat_history.json               # 对话记录持久化
+│   │   ├── alias.py                    # 口语别名归一化（阶段二）
+│   │   └── cache.py                    # 缓存后端抽象：本地 LRU + 可选 Redis（阶段四）
+│   ├── services/                       # 业务与数据访问层（GraphRAG 管线、诊断/药物服务、混合检索、向量索引，阶段三起）
+│   ├── data/                           # aliases.json（阶段二）、red_flags.json（阶段三急症词表）
+│   ├── scripts/                        # migrate_graph_phase2.py（阶段二）、build_vector_index.py（阶段三）
+│   ├── tests/                          # 契约测试 + 关键逻辑回归 + contract_snapshots 基线（阶段五）
+│   └── users.json / profiles.json / health_records.json / health_plans.json / chat_history.json  # 运行时持久化
 │
 ├── frontend/                           # Vue 3 前端
 │   ├── index.html                      # 入口 HTML（字体异步加载）

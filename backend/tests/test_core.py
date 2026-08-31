@@ -113,8 +113,9 @@ def test_auth_flow(client, monkeypatch):
     async def _noop(*a, **k):
         return None
 
+    # 路由经 save_json_async 落盘（store 层）；屏蔽 app 命名空间内该引用即可防写盘，
+    # save_json（同步）仅 store 内部与启动期使用，无需 patch
     monkeypatch.setattr(A, "save_json_async", _noop)
-    monkeypatch.setattr(A, "save_json", lambda *a, **k: None)
 
     user = "citest" + str(int(time.time()))[-8:]  # 控制在 20 字符内（RegisterRequest 上限）
     pwd = "Str0ngPass!2026"
