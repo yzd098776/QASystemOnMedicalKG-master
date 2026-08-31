@@ -31,6 +31,7 @@ from core.config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     RATE_LIMIT_AUTH_PER_MINUTE,
     RATE_LIMIT_CHAT_PER_MINUTE,
+    ENTITY_CACHE_TTL,
 )
 # 安全工具：双令牌签发/校验、jti 黑名单、密码哈希加固（详见 core/security.py）
 from core.security import (
@@ -71,20 +72,23 @@ if not DEEPSEEK_API_KEY:
 # 本文件顶部统一从该模块导入 get_driver / run_cypher / run_cypher_sync
 
 
-# ========== 简单缓存 ==========
-_cache = {}
-_cache_ttl = {}
+# ========== 缓存（阶段四：抽象见 core/cache.py） ==========
+# 默认进程内 LRU（容量上限 + TTL，适配单 worker 部署）；配置 REDIS_URL 后
+# 自动切换为 Redis 后端实现多实例共享。_cache_get/_cache_set 为兼容既有调用
+# 的薄封装：TTL 在写入时由后端管理，_cache_get 的 ttl 参数仅作签名兼容保留。
+from core.cache import (
+    get_cache as _get_cache,
+    entity_cache_key,
+    invalidate_user_caches,
+)
 
 
 def _cache_get(key: str, ttl: int = 300):
-    if key in _cache and time.time() - _cache_ttl.get(key, 0) < ttl:
-        return _cache[key]
-    return None
+    return _get_cache().get(key)
 
 
-def _cache_set(key: str, value):
-    _cache[key] = value
-    _cache_ttl[key] = time.time()
+def _cache_set(key: str, value, ttl: int = None):
+    _get_cache().set(key, value, ttl=ttl)
 
 
 # ========== 用户存储（内存 + JSON文件持久化） ==========
@@ -467,6 +471,9 @@ async def update_profile(profile: ProfileUpdate, username: str = Depends(get_cur
             data[field] = encrypt_field(data[field])
     profiles_db[username] = data
     await save_json_async(PROFILES_FILE, profiles_db)
+    # 档案更新即时失效：清除该用户名下所有 user:{username}: 前缀缓存（含导出快照），
+    # 保证紧随其后的数据导出/个性化读取看到最新档案
+    invalidate_user_caches(username)
     return {"message": "健康档案已更新"}
 
 
@@ -535,49 +542,69 @@ async def search_entities(
     type: Optional[str] = None,
     limit: int = Query(default=100, le=500),
     page: int = Query(default=1, ge=1),
+    cursor: Optional[str] = Query(default=None),
 ):
     # 输入校验：超过200字符返回400；空搜索词视为不带关键词过滤（保持原有行为）
     safe_search = _validate_entity_input(search, "搜索词")
     safe_type = _validate_entity_input(type, "实体类型")
 
+    # 翻页（阶段四）：保留既有 page/limit 契约；新增可选 cursor 游标参数做高效深翻页。
+    # 游标依赖 name 的稳定排序（下方所有查询统一 ORDER BY n.name，走阶段二建立的有序
+    # 索引；Disease 为普通索引亦支持 ORDER BY）。传 cursor 时忽略 page，用
+    # name > $cursor 定位代替大 OFFSET，深翻页耗时平稳；不传时与原页码翻页等价
+    # （仅额外补上 ORDER BY，使原先无序 SKIP 分页结果稳定，不改变字段契约）。
     skip = (page - 1) * limit
 
-    async def _do_search(search_term):
-        """按单个搜索词执行实体检索，返回 (nodes, links, total)"""
+    async def _do_search(search_term, cursor_val):
+        """按单个搜索词执行实体检索，返回 (nodes, links, total)
+
+        cursor_val 非空 → 游标模式（WHERE n.name > $cursor 定位、不带 SKIP）；
+        为空 → 页码模式（SKIP $skip LIMIT $limit）。两种模式统一 ORDER BY n.name，
+        保证翻页稳定（游标定位本身依赖该全序）。
+        """
+        use_cursor = bool(cursor_val)
+        # 分页子句：游标模式省 SKIP，页码模式保留 SKIP
+        order_paging = "ORDER BY n.name " + ("" if use_cursor else "SKIP $skip ") + "LIMIT $limit"
+        params = {"limit": limit}
+        if use_cursor:
+            params["cursor"] = cursor_val
+        else:
+            params["skip"] = skip
+
         if search_term and safe_type:
-            query = """
-            MATCH (n)
-            WHERE n.name CONTAINS $search AND $type IN labels(n)
-            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-            SKIP $skip LIMIT $limit
-            """
-            params = {"search": search_term, "type": safe_type, "skip": skip, "limit": limit}
+            query = (
+                "MATCH (n) WHERE n.name CONTAINS $search AND $type IN labels(n) "
+                + ("AND n.name > $cursor " if use_cursor else "")
+                + "RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props "
+                + order_paging
+            )
+            params.update({"search": search_term, "type": safe_type})
         elif search_term:
-            query = """
-            MATCH (n)
-            WHERE n.name CONTAINS $search
-            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-            SKIP $skip LIMIT $limit
-            """
-            params = {"search": search_term, "skip": skip, "limit": limit}
+            query = (
+                "MATCH (n) WHERE n.name CONTAINS $search "
+                + ("AND n.name > $cursor " if use_cursor else "")
+                + "RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props "
+                + order_paging
+            )
+            params.update({"search": search_term})
         elif safe_type:
             # Neo4j 标签不可参数化，仅允许白名单内的标签拼接进 Cypher；
             # 非白名单标签返回空结果（保持既有行为兼容，不改为 400）
             if safe_type not in ALLOWED_LABELS:
                 return [], [], 0
-            query = f"""
-            MATCH (n:{safe_type})
-            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-            SKIP $skip LIMIT $limit
-            """
-            params = {"skip": skip, "limit": limit}
+            query = (
+                f"MATCH (n:{safe_type}) "
+                + ("WHERE n.name > $cursor " if use_cursor else "")
+                + "RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props "
+                + order_paging
+            )
         else:
-            query = """
-            MATCH (n)
-            RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props
-            SKIP $skip LIMIT $limit
-            """
-            params = {"skip": skip, "limit": limit}
+            query = (
+                "MATCH (n) "
+                + ("WHERE n.name > $cursor " if use_cursor else "")
+                + "RETURN n.name AS name, labels(n)[0] AS label, properties(n) AS props "
+                + order_paging
+            )
 
         try:
             results = await run_cypher(query, params)
@@ -636,14 +663,16 @@ async def search_entities(
     # 精确匹配类接口不受影响，仍保持「规范名优先、未命中原词兜底」语义。
     nodes, links, total = [], [], 0
     search_terms = _alias_candidates(safe_search)
-    if len(search_terms) <= 1:
-        nodes, links, total = await _do_search(search_terms[0])
+    single_path = len(search_terms) <= 1
+    if single_path:
+        nodes, links, total = await _do_search(search_terms[0], cursor)
     else:
         merged_nodes, merged_links = [], []
         seen_names = set()
         seen_links = set()
         for term in search_terms:
-            t_nodes, t_links, t_total = await _do_search(term)
+            # 别名两路合并模式下禁用游标（各路按页码取回后合并去重），故传 cursor_val=None
+            t_nodes, t_links, t_total = await _do_search(term, None)
             total = t_total or total
             for n in t_nodes:
                 # 按实体名去重（同名实体以先返回的一路为准，保留其标签与简介）
@@ -659,7 +688,10 @@ async def search_entities(
         nodes = merged_nodes[:limit]
         links = merged_links
 
-    return {"nodes": nodes, "links": links, "total": total}
+    # next_cursor：仅单路、且本页取满 limit 时给出本页末实体名作为续翻游标；
+    # 别名两路合并模式不做游标深翻（返回 None，页码翻页仍可用）。无更多数据时为 None。
+    next_cursor = nodes[-1]["name"] if (single_path and nodes and len(nodes) >= limit) else None
+    return {"nodes": nodes, "links": links, "total": total, "next_cursor": next_cursor}
 
 
 @app.get("/api/kg/entity/{name}")
@@ -669,6 +701,12 @@ async def get_entity_detail(name: str):
     entity_name = _validate_entity_input(name, "实体名称")
     if not entity_name:
         raise HTTPException(status_code=404, detail="实体不存在")
+    # 实体详情缓存（阶段四）：图谱为只读数据，按请求实体名缓存已构造的响应对象，
+    # 命中直接返回，跳过 5 路 OPTIONAL MATCH 聚合查询；未命中（404）不缓存。
+    _cache = _get_cache()
+    cached_entity = _cache.get(entity_cache_key(entity_name))
+    if cached_entity is not None:
+        return cached_entity
     # 实体定位改为逐标签分支（_name_match_union）：原无标签 MATCH (n {name:$name})
     # 为全表扫描，逐标签后各分支走标签约束索引；后续 OPTIONAL MATCH 子句（含 s2 子句）语义不变
     query = (
@@ -709,6 +747,9 @@ async def get_entity_detail(name: str):
     node = r["n"]
     label = r["label"]
     props = dict(node) if hasattr(node, 'items') else {}
+    # 剔除向量属性 embedding（阶段三为向量检索新增），避免其流入实体详情响应与
+    # 前端「全属性」通用渲染（Drug/Food 等走 properties 列表展示，向量数组会刷屏）
+    props.pop("embedding", None)
 
     entity = {
         "name": matched_name,
@@ -724,6 +765,7 @@ async def get_entity_detail(name: str):
     elif label == "Symptom":
         entity["diseases"] = r["diseases"] or []
 
+    _cache.set(entity_cache_key(entity_name), entity, ttl=ENTITY_CACHE_TTL)
     return entity
 
 
@@ -862,6 +904,79 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, 
             links = [{"source": l["source"], "target": l["target"], "relType": l["relType"]} for l in link_results]
         except Exception:
             pass
+
+    return {"nodes": nodes, "links": links}
+
+
+@app.get("/api/kg/neighbors")
+async def get_neighbors(
+    name: str,
+    depth: int = Query(default=1, ge=1, le=2),
+    limit: int = Query(default=50, le=200),
+):
+    """增量拉取某实体的邻居子图（阶段四，供图谱页「展开下一跳」增量合并渲染）。
+
+    与 /api/kg/related 并存（不改动后者契约）：本接口逐跳独立 LIMIT 逐层扩展，
+    返回 {nodes, links}（含根节点自身），前端可合并进已有图而非整体重绘。
+    - name 为空→空结构；超过200字符→400（复用 _validate_entity_input）；
+    - depth 限 1|2，每跳各带一次 LIMIT（避免变长路径一次性展开爆炸）；
+    - 别名归一化：规范名优先、原词兜底定位根节点；标签交替锚定 a 走标签索引。
+    """
+    safe_name = _validate_entity_input(name, "实体名称")
+    if not safe_name:
+        return {"nodes": [], "links": []}
+    depth = int(depth)
+    limit = int(limit)
+
+    # 定位根实体（别名候选，规范名优先），确定实际命中名与标签；未命中→空结构
+    root_label = None
+    effective = safe_name
+    root_query = _name_match_union("n", "entity") + "\nRETURN labels(n)[0] AS label LIMIT 1"
+    for candidate in _alias_candidates(safe_name):
+        try:
+            rr = await run_cypher(root_query, {"entity": candidate})
+        except Exception as e:
+            logger.error(f"邻居根节点定位失败: {e}")
+            rr = []
+        if rr:
+            effective = candidate
+            root_label = rr[0]["label"]
+            break
+    if root_label is None:
+        return {"nodes": [], "links": []}
+
+    # 七类标签交替：让展开起点 a 命中阶段二建立的标签索引，避免无标签全表匹配
+    label_alternation = ":" + "|".join(sorted(ALLOWED_LABELS))
+    nodes = [{"name": effective, "label": root_label}]
+    links = []
+    seen = {effective}
+    frontier = [effective]
+    for _ in range(depth):
+        if not frontier:
+            break
+        # 从当前层沿无向关系扩展一跳，排除已收集节点，本跳独立 LIMIT
+        hop_query = (
+            f"MATCH (a{label_alternation})-[r]-(b)\n"
+            "WHERE a.name IN $names AND NOT b.name IN $visited\n"
+            "RETURN b.name AS name, labels(b)[0] AS label, a.name AS from_name,\n"
+            "       type(r) AS relType\n"
+            "LIMIT $limit"
+        )
+        try:
+            rows = await run_cypher(hop_query, {"names": frontier, "visited": list(seen), "limit": limit})
+        except Exception as e:
+            logger.error(f"邻居扩展失败: {e}")
+            break
+        new_frontier = []
+        for r in rows:
+            nm = r.get("name")
+            if not nm or nm in seen:
+                continue
+            seen.add(nm)
+            nodes.append({"name": nm, "label": r.get("label")})
+            links.append({"source": r["from_name"], "target": nm, "relType": r.get("relType")})
+            new_frontier.append(nm)
+        frontier = new_frontier
 
     return {"nodes": nodes, "links": links}
 
@@ -1544,10 +1659,18 @@ async def clear_chat_history(username: str = Depends(get_current_user)):
 async def export_user_data(username: str = Depends(get_current_user)):
     """聚合导出当前用户全部数据：账户信息（不含密码字段）、健康档案（解密后）、
     健康记录、健康计划、聊天记录；缺失处给空对象/空数组"""
+    # 导出数据缓存（阶段四）：聚合五处数据 + 敏感字段解密有额外开销，按用户缓存短 TTL 快照。
+    # 档案更新与删号即时失效（见 update_profile / delete_user_data），
+    # 记录/计划/聊天等其他数据写入以 TTL 最终一致（键前缀 user:{username}: 与失效约定一致）。
+    cache = _get_cache()
+    cache_key = f"user:{username}:export"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
     user_info = {
         k: v for k, v in users_db.get(username, {}).items() if k != "password"
     }
-    return {
+    result = {
         "username": username,
         "user": user_info,
         "profile": _decrypted_profile(username),
@@ -1555,6 +1678,8 @@ async def export_user_data(username: str = Depends(get_current_user)):
         "health_plans": health_plans_db.get(username, []),
         "chat_history": chat_history_db.get(username, {"sessions": []}),
     }
+    cache.set(cache_key, result, ttl=30)
+    return result
 
 
 @app.delete("/api/user/data")
@@ -1574,6 +1699,8 @@ async def delete_user_data(username: str = Depends(get_current_user)):
     await save_json_async(HEALTH_RECORDS_FILE, health_records_db)
     await save_json_async(HEALTH_PLANS_FILE, health_plans_db)
     await save_json_async(CHAT_HISTORY_FILE, chat_history_db)
+    # 删号即时失效该用户所有缓存（导出快照等），避免删除后仍能读到已清除数据的缓存视图
+    invalidate_user_caches(username)
     return {"message": "账号及全部数据已删除"}
 
 

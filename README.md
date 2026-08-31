@@ -215,6 +215,40 @@
 
 **Text2Cypher 长尾覆盖（白名单）**：仅在配置了 `DEEPSEEK_API_KEY` 且常规检索三元组不足（<3 条）时触发一次。后端不信任模型输出，强制校验：去注释后仅允许只读子句（MATCH / OPTIONAL MATCH / WHERE / WITH / RETURN / ORDER BY / SKIP / LIMIT / DISTINCT / AS / UNION），出现 CREATE/MERGE/DELETE/DETACH/SET/REMOVE/DROP/CALL/FOREACH/分号/多语句一律拒绝；无 LIMIT 自动追加 `LIMIT 50`；执行用带超时的 **Neo4j 只读访问模式**事务（`TEXT2CYPHER_TIMEOUT`；即便白名单校验漏网，服务端仍会拒绝任何写子句，形成纵深防御），结果行数上限 50。校验/执行/超时任一失败自动降级回常规检索增强流程。可通过 `TEXT2CYPHER_ENABLED=false` 关闭。
 
+### 3.10 性能与渲染优化（阶段四）
+
+**缓存层（`backend/core/cache.py`）**：统一 `CacheBackend` 抽象，默认后端为进程内 **LRU**（容量上限 `CACHE_MAX_ENTRIES`=1024 + 每键 TTL），适配**默认单 worker 部署**（uvicorn 单进程）。配置 `.env` 的 `REDIS_URL` 后自动切换为 **Redis** 后端实现多 worker/多实例共享（`redis` 为可选依赖 `pip install "redis[hiredis]"`，未安装或连接失败告警并降级本地 LRU，零强制新增依赖）。当前缓存点：
+- 实体详情 `/api/kg/entity/{name}`（`ENTITY_CACHE_TTL`，命中跳过 5 路 `OPTIONAL MATCH` 聚合）；
+- 全库实体总数 `kg_total_count`；
+- 用户数据导出 `/api/user/export`（含解密的五源聚合，短 TTL 快照）——**档案更新 / 删号即时失效**（`invalidate_user_caches`），其余数据写入以 TTL 最终一致；
+- 提供 `invalidate_entity(name)` 按实体精准失效（图谱经脚本更新后可调用）。
+
+> ⚠️ 多 worker 部署须知：本地 LRU 为进程内实现，多 worker 各进程缓存相互独立、不保证跨进程一致；需要多 worker 或水平扩容时**必须配置 `REDIS_URL`**（同时可消解阶段一遗留的「限流/令牌黑名单进程内不共享」问题）。
+
+**游标翻页（`/api/kg/entities`）**：保留既有 `page`/`limit` 契约，所有分支统一补 `ORDER BY n.name`（修正原先无排序时 `SKIP` 深翻页可能重复/遗漏），并新增可选 `cursor` 参数——以 `WHERE n.name > $cursor` 定位代替大 `OFFSET`，深翻页耗时平稳；响应追加 `next_cursor`（本页满 `limit` 时给出末实体名，无更多为 `null`；别名两路合并模式不做游标深翻、返回 `null`，页码仍可用）。游标依赖阶段二建立的有序索引（`Disease` 为普通索引亦支持 `ORDER BY name`）。
+
+**慢查询日志**：`run_cypher` / `run_readonly` 统一计时埋点（`services/graph_db.py`），执行耗时超过 `SLOW_QUERY_MS`（默认 200ms）记 WARNING，用于定位性能热点。
+
+**图谱渲染（`/api/kg/neighbors`）**：新增增量接口 `GET /api/kg/neighbors?name=&depth=1|2&limit=`（**不改动 `/api/kg/related` 契约**），逐跳各带独立 `LIMIT` 逐层扩展、避免变长路径一次性展开爆炸。前端 `KnowledgeGraphView` 维护累积的 `allNodes/allLinks`，「展开下一跳」合并进当前子图而非整体重绘；并实现 **LOD**：节点数 >150 时隐藏文字标签（保留悬停 tooltip）以保帧率。首屏仍以选定实体 `depth=1` 局部展开，非一次性渲染全库。
+
+**前端体积（`vite.config.js` manualChunks）**：将第三方库拆分为独立可并行加载/长期缓存的 chunk。拆分前后主要产物（minify 后）：
+
+| chunk | 拆分前 | 拆分后 |
+| --- | --- | --- |
+| 主 `index` | ~989 KB（含全部 vendor） | **5.65 KB** |
+| `KnowledgeGraphView` | ~493 KB（含 echarts） | **16 KB** |
+| `ChatView` | ~81 KB | **15 KB** |
+| `vendor-echarts` | （混入主/视图 chunk） | 477 KB（独立） |
+| `vendor-element-plus` | （混入主 chunk） | 1015 KB（独立，长期缓存） |
+| `vendor-vue` / `vendor-utils` | （混入主 chunk） | 31 KB / 111 KB |
+
+警告线自 1000 恢复为 **500 KB**（真实阈值）：业务路由 chunk 均已 <20 KB，构建警告仅剩 `vendor-element-plus`/`vendor-echarts` 两个**第三方库体积下限**（独立 chunk、命中长期缓存，非业务代码问题）。
+
+**渲染引擎对比结论（默认不迁移）**：项目当前用 ECharts GraphChart（按需引入）+ 力导向。
+- **Cytoscape.js**：交互与样式表达强、`fcose`/`cola` 等布局对数十万级静态图分析更优；但体积约 ~1MB、需重写现有渲染层。
+- **sigma.js**（配 graphology）：WebGL 渲染，>1 万节点仍流畅；样式定制门槛高、生态迁移成本大。
+- **结论**：本系统的诉求是「以选中实体为中心的局部子图 + 增量展开 + LOD」，ECharts 按需引入已满足且与现有代码深度耦合，迁移收益不匹配成本；**默认维持 ECharts**，仅当将来需要全库级交互式图分析时再评估 sigma（WebGL）。
+
 
 ---
 
@@ -488,7 +522,7 @@ npm run build
 ### 9.1 技术亮点
 
 - **真正的流式输出**：基于 Fetch API + ReadableStream 实现 SSE 流式传输，后端使用 `httpx.aiter_lines()` 逐行推送，前端逐字渲染打字机效果
-- **知识图谱可视化**：ECharts 力导向布局渲染 4.4 万节点，支持缩放/拖拽/筛选/导出，悬停高亮关联节点
+- **知识图谱可视化**：ECharts 力导向布局**按需渲染局部子图**（首屏以选定实体为中心 depth=1 展开，非一次性渲染全库 4.4 万实体）；「展开下一跳」通过 `/api/kg/neighbors` 增量合并节点/边，节点数超过 150 时启用 LOD 自动隐藏文字标签以保帧率；支持缩放/拖拽/筛选/导出、悬停高亮关联节点
 - **ECharts 按需引入**：仅加载 GraphChart 所需模块，打包体积减少 60%
 - **后端 N+1 优化**：将 21 次独立 Cypher 查询合并为 1 次，使用 OPTIONAL MATCH 一次返回所有关联数据
 - **异步非阻塞**：Neo4j 同步驱动通过 `asyncio.to_thread` 包装，不阻塞 FastAPI 事件循环

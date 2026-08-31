@@ -129,3 +129,18 @@ VECTOR_INDEX_PREFIX = os.getenv("VECTOR_INDEX_PREFIX", "kg_embedding")
 # Text2Cypher 长尾覆盖：总开关与只读执行超时（秒）
 TEXT2CYPHER_ENABLED = _read_bool("TEXT2CYPHER_ENABLED", True)
 TEXT2CYPHER_TIMEOUT = _read_int("TEXT2CYPHER_TIMEOUT", 10)
+
+# ========== 缓存与性能（阶段四） ==========
+# Redis 连接串：为空表示不启用，缓存走进程内 LRU（默认单 worker 部署）；
+# 非空则尝试用 Redis 后端，使多 worker/多实例共享缓存（需 pip install "redis[hiredis]"）
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
+
+# 本地 LRU 容量上限（超出淘汰最久未使用项）与默认存活时间（秒）
+CACHE_MAX_ENTRIES = _read_int("CACHE_MAX_ENTRIES", 1024)
+CACHE_DEFAULT_TTL = _read_int("CACHE_DEFAULT_TTL", 300)
+
+# 实体详情缓存存活时间（秒）：图谱为只读数据，短 TTL 兼顾新鲜度与命中率
+ENTITY_CACHE_TTL = _read_int("ENTITY_CACHE_TTL", 300)
+
+# 慢查询日志阈值（毫秒）：run_cypher 执行耗时超过该值时记 WARNING，便于定位性能热点
+SLOW_QUERY_MS = _read_int("SLOW_QUERY_MS", 200)

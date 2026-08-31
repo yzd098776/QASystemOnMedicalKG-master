@@ -23,6 +23,12 @@ const pathTarget = ref('')
 const pathResult = shallowRef([])
 const loading = ref(false)
 
+// 增量渲染累积状态（阶段四）：维护当前图上全部节点/边，「展开下一跳」增量并入
+const allNodes = shallowRef([])
+const allLinks = shallowRef([])
+// LOD（细节层次）阈值：节点数超过该值时隐藏文字标签，避免大规模力导向图标签拥挤掉帧
+const LOD_LABEL_THRESHOLD = 150
+
 const entityTypes = [
   { label: '疾病', color: '#e74c3c', type: 'Disease' },
   { label: '药品', color: '#3498db', type: 'Drug' },
@@ -121,10 +127,24 @@ function deduplicateNodes(nodes) {
   })
 }
 
-function renderGraph(nodes, links) {
+function renderGraph(nodes, links, mode = 'replace') {
   if (!chart) return
-  const uniqueNodes = deduplicateNodes(nodes)
+  if (mode === 'merge') {
+    // 增量合并：按 name 去重并入已有节点，按 (source,target,relType) 去重并入已有边
+    const nm = new Map(allNodes.value.map(n => [n.name, n]))
+    for (const n of nodes) if (!nm.has(n.name)) nm.set(n.name, n)
+    allNodes.value = Array.from(nm.values())
+    const lk = new Map(allLinks.value.map(l => [`${l.source}|${l.target}|${l.relType}`, l]))
+    for (const l of links) lk.set(`${l.source}|${l.target}|${l.relType}`, l)
+    allLinks.value = Array.from(lk.values())
+  } else {
+    allNodes.value = nodes
+    allLinks.value = links
+  }
+  const uniqueNodes = deduplicateNodes(allNodes.value)
   const nodeNameSet = new Set(uniqueNodes.map(n => n.name))
+  // LOD：节点规模超过阈值时隐藏文字标签，仅保留悬停 tooltip，保证大图渲染流畅
+  const showLabels = uniqueNodes.length <= LOD_LABEL_THRESHOLD
 
   const graphNodes = uniqueNodes.map(n => {
     const label = n.label || 'Disease'
@@ -139,7 +159,7 @@ function renderGraph(nodes, links) {
     }
   })
 
-  const graphLinks = links
+  const graphLinks = allLinks.value
     .filter(l => nodeNameSet.has(l.source) && nodeNameSet.has(l.target))
     .map(l => ({
       source: l.source,
@@ -173,7 +193,7 @@ function renderGraph(nodes, links) {
         zoom: 0.7,
         force: { repulsion: 350, gravity: 0.06, edgeLength: [80, 220] },
         categories: categoryNames.map(n => ({ name: n })),
-        label: { show: true, fontSize: 11, position: 'bottom', distance: 5, color: '#334155', fontWeight: 500 },
+        label: { show: showLabels, fontSize: 11, position: 'bottom', distance: 5, color: '#334155', fontWeight: 500 },
         emphasis: {
           focus: 'adjacency',
           lineStyle: { width: 4 },
@@ -265,10 +285,12 @@ async function findPath() {
 }
 
 async function expandRelated(name) {
+  // 阶段四：改用 /api/kg/neighbors 增量拉取下一跳并合并进当前图（不再整体重绘 related）
   loading.value = true
   try {
-    const res = await request.get('/api/kg/related', { params: { entity: name, depth: 1 } })
-    if (res.nodes?.length) renderGraph(res.nodes, res.links || [])
+    const res = await request.get('/api/kg/neighbors', { params: { name, depth: 1, limit: 60 } })
+    if (res.nodes?.length) renderGraph(res.nodes, res.links || [], 'merge')
+    else ElMessage.info('该实体没有更多可展开的关联')
   } catch { ElMessage.error('加载失败') }
   finally { loading.value = false }
 }
@@ -437,7 +459,7 @@ function exportImage() {
         </template>
         <div class="mt-5 flex gap-2">
           <el-button type="primary" @click="expandRelated(selectedEntity.name)">
-            <el-icon class="mr-1"><Connection /></el-icon>展开关联
+            <el-icon class="mr-1"><Connection /></el-icon>展开下一跳
           </el-button>
           <el-button @click="consultAI(selectedEntity)">
             <el-icon class="mr-1"><ChatDotRound /></el-icon>咨询AI

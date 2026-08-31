@@ -10,12 +10,23 @@ Neo4j 连接与 Cypher 执行工具（阶段三从 app.py 抽取，供全管线�
 
 import asyncio
 import logging
+import time
 
 from neo4j import GraphDatabase, READ_ACCESS
 
-from core.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD
+from core.config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, SLOW_QUERY_MS
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_log_slow(elapsed_ms: float, query: str):
+    """统一慢查询埋点：执行耗时超过阈值（SLOW_QUERY_MS）记 WARNING。
+
+    折叠空白并截断查询文本，避免日志被超长语句刷屏；用于定位性能热点。
+    """
+    if elapsed_ms >= SLOW_QUERY_MS:
+        compact = " ".join(query.split())
+        logger.warning("慢查询 %.0fms（阈值 %dms）: %.160s", elapsed_ms, SLOW_QUERY_MS, compact)
 
 # 驱动单例：与原 app.py 的连接参数保持一致（连接池上限 50、获取超时 30 秒）
 _driver = None
@@ -43,11 +54,17 @@ def close_driver():
 
 
 def run_cypher_sync(query: str, parameters: dict = None):
-    """同步执行 Cypher 并物化为字典列表（结果集在会话关闭前消费完毕）"""
+    """同步执行 Cypher 并物化为字典列表（结果集在会话关闭前消费完毕）
+
+    统一计时埋点：耗时超过 SLOW_QUERY_MS 记慢查询日志（阶段四）。
+    """
     d = get_driver()
+    start = time.perf_counter()
     with d.session() as session:
         result = session.run(query, parameters or {})
-        return [dict(record) for record in result]
+        rows = [dict(record) for record in result]
+    _maybe_log_slow((time.perf_counter() - start) * 1000, query)
+    return rows
 
 
 async def run_cypher(query: str, parameters: dict = None):
@@ -69,6 +86,7 @@ async def run_readonly(query: str, parameters: dict = None, timeout: float = 10.
     def _session_work():
         # 以 Neo4j 只读访问模式开会话：即便 Cypher 白名单校验漏网，
         # 服务端也会拒绝任何写子句（纵深防御），配合事务超时双重兜底
+        start = time.perf_counter()
         with d.session(default_access_mode=READ_ACCESS) as session:
             tx = session.begin_transaction(timeout=timeout)
             try:
@@ -79,5 +97,7 @@ async def run_readonly(query: str, parameters: dict = None, timeout: float = 10.
             except Exception:
                 tx.rollback()
                 raise
+            finally:
+                _maybe_log_slow((time.perf_counter() - start) * 1000, query)
 
     return await asyncio.to_thread(_session_work)
