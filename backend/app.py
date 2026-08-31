@@ -301,16 +301,25 @@ async def update_profile(profile: ProfileUpdate, username: str = Depends(get_cur
 
 
 # ========== 知识图谱接口 ==========
-def sanitize_input(text: str) -> str:
-    """防止Cypher注入"""
-    if not text:
-        return ""
-    # 移除可能的注入字符
-    forbidden = [";", "//", "/*", "*/", "DROP", "DELETE", "REMOVE", "DETACH"]
-    result = text
-    for f in forbidden:
-        result = result.replace(f, "")
-    return result.strip()
+# 模块级实体标签白名单：Neo4j 节点标签不可参数化，只有该白名单内的标签才允许拼接进 Cypher；
+# 该白名单同时供后续 Text2Cypher 的白名单校验复用
+ALLOWED_LABELS = {"Disease", "Drug", "Symptom", "Food", "Check", "Department", "Producer"}
+
+
+def _validate_entity_input(value, name="参数"):
+    """轻量输入校验助手：
+    - 空值/纯空白返回 None，由调用方按各自契约返回空结果（保持原有“未命中返回空结构”行为）
+    - 长度超过 200 时返回 400，拦截明显异常输入
+    所有 Cypher 查询均以参数化方式传值，本身无注入风险，无需再做关键词黑名单过滤。
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if len(value) > 200:
+        raise HTTPException(status_code=400, detail=f"{name}过长，请控制在200字符以内")
+    return value
 
 
 @app.get("/api/kg/entities")
@@ -320,8 +329,9 @@ async def search_entities(
     limit: int = Query(default=100, le=500),
     page: int = Query(default=1, ge=1),
 ):
-    safe_search = sanitize_input(search) if search else None
-    safe_type = sanitize_input(type) if type else None
+    # 输入校验：超过200字符返回400；空搜索词视为不带关键词过滤（保持原有行为）
+    safe_search = _validate_entity_input(search, "搜索词")
+    safe_type = _validate_entity_input(type, "实体类型")
 
     skip = (page - 1) * limit
 
@@ -342,9 +352,9 @@ async def search_entities(
         """
         params = {"search": safe_search, "skip": skip, "limit": limit}
     elif safe_type:
-        # Neo4j 不支持参数化标签，使用白名单校验
-        allowed_labels = {"Disease", "Drug", "Symptom", "Food", "Check", "Department", "Producer"}
-        if safe_type not in allowed_labels:
+        # Neo4j 标签不可参数化，仅允许白名单内的标签拼接进 Cypher；
+        # 非白名单标签返回空结果（保持既有行为兼容，不改为 400）
+        if safe_type not in ALLOWED_LABELS:
             return {"nodes": [], "links": [], "total": 0}
         query = f"""
         MATCH (n:{safe_type})
@@ -411,7 +421,11 @@ async def search_entities(
 
 @app.get("/api/kg/entity/{name}")
 async def get_entity_detail(name: str):
-    safe_name = sanitize_input(name)
+    # 路径参数为空时按未命中处理返回 404（保持既有行为）；超长返回 400；
+    # 查询本身已参数化（$name），原始值直接传入即可，无需黑名单过滤
+    entity_name = _validate_entity_input(name, "实体名称")
+    if not entity_name:
+        raise HTTPException(status_code=404, detail="实体不存在")
     query = """
     MATCH (n {name: $name})
     OPTIONAL MATCH (n)-[:has_symptom]->(s:Symptom)
@@ -428,7 +442,7 @@ async def get_entity_detail(name: str):
       collect(DISTINCT d.name) AS diseases
     """
     try:
-        results = await run_cypher(query, {"name": safe_name})
+        results = await run_cypher(query, {"name": entity_name})
     except Exception as e:
         logger.error(f"实体详情查询失败: {e}")
         raise HTTPException(status_code=500, detail="查询失败")
@@ -442,7 +456,7 @@ async def get_entity_detail(name: str):
     props = dict(node) if hasattr(node, 'items') else {}
 
     entity = {
-        "name": safe_name,
+        "name": entity_name,
         "label": label,
         "properties": props,
     }
@@ -459,9 +473,19 @@ async def get_entity_detail(name: str):
 
 
 @app.get("/api/kg/path")
-async def find_path(source: str, target: str, max_depth: int = Query(default=5, le=10)):
-    safe_source = sanitize_input(source)
-    safe_target = sanitize_input(target)
+async def find_path(source: str, target: str, max_depth: int = Query(default=5, ge=1, le=10)):
+    # 空输入直接返回空路径结果，保持“未命中返回空结构”行为；超长返回 400；
+    # source/target 通过参数化（$source/$target）传入，无需黑名单过滤
+    safe_source = _validate_entity_input(source, "起始实体")
+    safe_target = _validate_entity_input(target, "目标实体")
+    if not safe_source or not safe_target:
+        return {"paths": []}
+
+    # Neo4j 变长关系上限不可参数化，depth 已由 FastAPI Query(ge/le) 约束为 int，
+    # 此处显式强转并做范围校验，双保险防止拼接注入
+    max_depth = int(max_depth)
+    if not 1 <= max_depth <= 10:
+        raise HTTPException(status_code=400, detail="max_depth 必须在 1 到 10 之间")
 
     query = """
     MATCH path = shortestPath(
@@ -494,8 +518,17 @@ async def find_path(source: str, target: str, max_depth: int = Query(default=5, 
 
 
 @app.get("/api/kg/related")
-async def get_related_entities(entity: str, depth: int = Query(default=1, le=3)):
-    safe_entity = sanitize_input(entity)
+async def get_related_entities(entity: str, depth: int = Query(default=1, ge=1, le=3)):
+    # 空输入直接返回空结构，保持既有行为；超长返回 400；实体名经参数化（$entity）传入
+    safe_entity = _validate_entity_input(entity, "实体名称")
+    if not safe_entity:
+        return {"nodes": [], "links": []}
+
+    # Neo4j 变长关系上限不可参数化，depth 已由 FastAPI Query(ge/le) 约束为 int，
+    # 此处显式强转并做范围校验，双保险防止拼接注入
+    depth = int(depth)
+    if not 1 <= depth <= 3:
+        raise HTTPException(status_code=400, detail="depth 必须在 1 到 3 之间")
 
     if depth == 1:
         query = """
@@ -554,7 +587,13 @@ async def get_related_entities(entity: str, depth: int = Query(default=1, le=3))
 # ========== 疾病自查接口 ==========
 @app.post("/api/diagnosis")
 async def diagnosis(req: DiagnosisRequest):
-    symptoms = [sanitize_input(s) for s in req.symptoms if s.strip()]
+    # 空症状项跳过（保持既有行为）；单个症状项超过200字符返回 400；
+    # 症状列表经参数化（$symptoms）传入，无需黑名单过滤
+    symptoms = []
+    for s in req.symptoms:
+        item = _validate_entity_input(s, "症状项")
+        if item:
+            symptoms.append(item)
     if not symptoms:
         raise HTTPException(status_code=400, detail="请至少提供一个症状")
 
@@ -598,7 +637,11 @@ async def diagnosis(req: DiagnosisRequest):
 # ========== 用药安全接口 ==========
 @app.get("/api/drug/contraindication")
 async def drug_contraindication(drug: str):
-    safe_drug = sanitize_input(drug)
+    # 空药品名按未命中处理返回 404（与既有行为一致）；超长返回 400；
+    # 药品名经参数化（$name）传入，无需黑名单过滤
+    safe_drug = _validate_entity_input(drug, "药品名称")
+    if not safe_drug:
+        raise HTTPException(status_code=404, detail="未找到该药品")
 
     # 查询药品信息
     query = """
@@ -661,7 +704,12 @@ async def drug_contraindication(drug: str):
 
 @app.get("/api/food/contraindication")
 async def food_contraindication(query: str, type: str = "food"):
-    safe_query = sanitize_input(query)
+    # 空输入按既有契约返回空结构；超长返回 400；查询词经参数化（$name）传入
+    safe_query = _validate_entity_input(query, "查询内容")
+    if not safe_query:
+        if type == "food":
+            return {"name": query or "", "diseases": []}
+        return {"name": query or "", "doEat": [], "noEat": [], "recommandEat": []}
 
     if type == "food":
         # 按食物查询
@@ -737,7 +785,12 @@ async def food_contraindication(query: str, type: str = "food"):
 
 @app.post("/api/drug/interaction")
 async def drug_interaction(req: DrugInteractionRequest):
-    drugs = [sanitize_input(d) for d in req.drugs if d.strip()]
+    # 空药品名跳过（保持既有行为）；超过200字符返回 400；药品名经参数化传入
+    drugs = []
+    for d in req.drugs:
+        item = _validate_entity_input(d, "药品名称")
+        if item:
+            drugs.append(item)
     if len(drugs) < 2:
         raise HTTPException(status_code=400, detail="请至少提供两种药品")
 
@@ -781,7 +834,11 @@ async def drug_interaction(req: DrugInteractionRequest):
 # ========== 就医指南接口 ==========
 @app.get("/api/guide/department")
 async def guide_department(query: str):
-    safe_query = sanitize_input(query)
+    # 空输入返回空科室列表，保持既有“未命中返回空结构”行为；超长返回 400；
+    # 查询词经参数化（$query）传入，无需黑名单过滤
+    safe_query = _validate_entity_input(query, "查询内容")
+    if not safe_query:
+        return {"departments": []}
 
     # 合并查询：科室及其关联的疾病和检查
     q = """
@@ -834,7 +891,11 @@ async def guide_department(query: str):
 
 @app.get("/api/guide/check")
 async def guide_check(query: str):
-    safe_query = sanitize_input(query)
+    # 空输入按未命中处理返回 404（与既有行为一致）；超长返回 400；
+    # 查询词经参数化（$name）传入，无需黑名单过滤
+    safe_query = _validate_entity_input(query, "查询内容")
+    if not safe_query:
+        raise HTTPException(status_code=404, detail="未找到该检查项目")
 
     q = """
     MATCH (c:Check {name: $name})
