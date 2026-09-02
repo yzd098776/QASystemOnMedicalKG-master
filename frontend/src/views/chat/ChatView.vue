@@ -74,7 +74,7 @@ function createSession() {
   activeSessionId.value = id
 }
 
-function deleteSession(id) {
+async function deleteSession(id) {
   const idx = sessions.value.findIndex(s => s.id === id)
   if (idx >= 0) {
     sessions.value.splice(idx, 1)
@@ -83,9 +83,9 @@ function deleteSession(id) {
       if (sessions.value.length === 0) createSession()
     }
   }
-  // 同步到后端
-  if (sessions.value.length && sessions.value[0].messages.length) {
-    saveSession(sessions.value[0])
+  // 同步删除后端存储（必须调后端单删接口，否则重启后 loadHistory 会把已删会话拉回复活）
+  if (userStore.token) {
+    try { await request.delete(`/api/chat/history/${encodeURIComponent(id)}`) } catch {}
   }
 }
 

@@ -10,6 +10,9 @@ services:
       - "7687:7687"   # Bolt
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?请在 .env 设置 NEO4J_PASSWORD}
+      # 内存按本机实际（WSL 总内存 7G）配置，勿照抄线上大机器参数
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 1G
     volumes:
       - neo4j-data:/data
     healthcheck:
@@ -44,6 +47,27 @@ services:
       - backend
     restart: unless-stopped
 
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "127.0.0.1:3306:3306"   # 只映射本机回环，不暴露局域网
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: medicalkg
+      MYSQL_USER: kguser
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 设置 MYSQL_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ukguser", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
   # 可选 Redis：启用多 worker 共享缓存时取消注释，并在 .env 设 REDIS_URL=redis://redis:6379/0
   # redis:
   #   image: redis:7-alpine
@@ -53,3 +77,4 @@ services:
 
 volumes:
   neo4j-data:
+  mysql-data:

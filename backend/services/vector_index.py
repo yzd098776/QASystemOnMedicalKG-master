@@ -54,20 +54,22 @@ def _char_ngrams(text: str, ns=(1, 2, 3)):
             yield text[i:i + n]
 
 
-def embed(text: str):
+def embed_hash(text: str, dim: int = None):
     """纯 Python 哈希字符 n-gram 嵌入（feature hashing）。
 
     每个 n-gram 经 blake2b 哈希映射到固定维度桶，哈希位决定符号（+1/-1），
     累加后 L2 归一化。零依赖、确定性（同一文本恒得同一向量）。
-    局限见模块顶部说明；未来可整体替换为真实嵌入模型。
+    局限见模块顶部说明；阶段 B 起作为语义嵌入不可用时的兜底路径，
+    dim 可与语义索引维度对齐（保证降级后向量查询仍合法）。
     """
-    vec = [0.0] * EMBEDDING_DIM
+    dim = dim or EMBEDDING_DIM
+    vec = [0.0] * dim
     if not isinstance(text, str) or not text.strip():
         return vec
     for gram in _char_ngrams(text):
         digest = hashlib.blake2b(gram.encode("utf-8"), digest_size=8).digest()
         h = int.from_bytes(digest, "big")
-        idx = h % EMBEDDING_DIM
+        idx = h % dim
         sign = 1.0 if (h >> 63) & 1 == 0 else -1.0
         vec[idx] += sign
     norm = math.sqrt(sum(v * v for v in vec))
@@ -76,13 +78,32 @@ def embed(text: str):
     return vec
 
 
+def embed(text: str):
+    """兼容入口：默认维度的哈希嵌入（provider=hash 路径与升级前逐位一致）"""
+    return embed_hash(text, dim=EMBEDDING_DIM)
+
+
+def _active_dim() -> int:
+    """当前生效嵌入维度（语义模式取 SEMANTIC_EMBEDDING_DIM）。
+
+    延迟导入规避 vector_index <-> embedding_provider 的模块级循环依赖。
+    """
+    from .embedding_provider import active_dim
+    return active_dim()
+
+
 def create_index_cypher(label: str) -> str:
-    """生成建向量索引的幂等语句（维度与相似度函数须与写入嵌入一致）"""
+    """生成建向量索引的幂等语句（维度取当前生效嵌入维度，与写入嵌入一致）。
+
+    Neo4j 社区版说明：向量索引作用于普通 LIST<FLOAT> 属性（n.embedding），
+    无需也不得使用 vector() 类型属性；索引维度创建后不可变更，
+    变更必须 DROP 再 CREATE（由 build_vector_index.py 自动检测处理）。
+    """
     return (
         f"CREATE VECTOR INDEX {index_name_for(label)} IF NOT EXISTS "
         f"FOR (n:{label}) ON (n.embedding) "
         f"OPTIONS {{indexConfig: {{"
-        f"`vector.dimensions`: {EMBEDDING_DIM}, "
+        f"`vector.dimensions`: {_active_dim()}, "
         f"`vector.similarity_function`: 'cosine'"
         f"}}}}"
     )
@@ -117,6 +138,38 @@ def ensure_vector_indexes(run_sync):
         logger.info("全部向量索引已上线")
 
 
+_INDEX_DIM_CACHE = {"dim": None, "ts": 0.0}
+
+
+async def query_index_dim():
+    """读取 Neo4j 现存向量索引的实际维度（60s 缓存；索引缺失/查询失败返回 None）。
+
+    用途：语义 provider 降级为哈希向量时按此维度产出兜底向量，
+    保证降级路径的查询仍与索引匹配（等价升级前哈希行为，不因维度不匹配空转）。
+    """
+    import time as _time
+    from .graph_db import run_cypher
+
+    now = _time.time()
+    if _INDEX_DIM_CACHE["dim"] is not None and now - _INDEX_DIM_CACHE["ts"] < 60:
+        return _INDEX_DIM_CACHE["dim"]
+    try:
+        # 实测 SHOW VECTOR INDEXES 的 options 键形随版本变化，
+        # 用通用 SHOW INDEXES（build 脚本维度检测同源，可靠）
+        rows = await run_cypher(
+            "SHOW INDEXES YIELD name, type, options RETURN name, type, options", {})
+    except Exception:  # noqa: BLE001 老版本语法/权限问题：拿不到就按 None 处理
+        return None
+    for r in rows:
+        if r.get("name") in {index_name_for(l) for l in VECTOR_LABELS}:
+            cfg = (r.get("options") or {}).get("indexConfig") or {}
+            dim = cfg.get("`vector.dimensions`") or cfg.get("vector.dimensions")
+            if dim:
+                _INDEX_DIM_CACHE.update(dim=int(dim), ts=now)
+                return int(dim)
+    return None
+
+
 async def vector_recall(question: str, per_label_k: int = 10):
     """向量召回：对三类标签的向量索引分别执行 queryNodes，合并返回。
 
@@ -124,10 +177,17 @@ async def vector_recall(question: str, per_label_k: int = 10):
     索引不可用/查询失败时返回空列表（由调用方降级为纯关键词检索）。
     注意：db.index.vector.queryNodes 的索引名必须为字面量（不可参数化），
     索引名来自本模块白名单校验的生成函数，不接受外部输入。
+
+    查询嵌入经 embedding_provider 统一出口：provider=hash 时与升级前逐位一致；
+    语义模式下远程失败/超时/熔断由 provider 内部降级为哈希向量（维度对齐索引），
+    本函数无须再关心降级细节。
     """
     from .graph_db import run_cypher
+    from .embedding_provider import embed_query_async
 
-    query_vec = embed(question)
+    # 降级哈希向量对齐索引实际维度（provider=hash 时维度天然一致，无影响）
+    fallback_dim = await query_index_dim()
+    query_vec = await embed_query_async(question, fallback_dim=fallback_dim)
     if not any(query_vec):
         return []
     hits = []

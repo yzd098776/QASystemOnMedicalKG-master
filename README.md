@@ -209,7 +209,30 @@
 
 **检索增强（rag 分支）**：实体识别结果 → 混合检索锤定实体（关键词路：别名归一 + `CONTAINS`；向量路：余弦相似）双路加权融合（权重见 `.env` 的 `HYBRID_KEYWORD_WEIGHT` / `HYBRID_VECTOR_WEIGHT`）→ 每实体取 1-2 跳邻居三元组（单实体≤20 条、总量≤60 条）→ 分配稳定编号 T1..Tn 注入提示词 → 模型仅依据三元组回答并在引用句末标注【T1】【T3】→ 后端解析标记生成 sources 帧。
 
-**向量检索方案与局限**：选型为 Neo4j 5.26 原生 vector index（免独立向量库运维），嵌入采用**纯 Python 哈希字符 n-gram 嵌入**（blake2b 特征哈希，默认 256 维，零新增依赖）。局限：哈希嵌入只能捕捉字面重合，**不具备语义理解能力**，对「脑子里嗡嗡响」这类口语召回依赖字面字符重合，效果有限。升级路径：未来可换用真实嵌入模型（如 sentence-transformers 或远程嵌入 API），仅需替换 `services/vector_index.py` 的 `embed()` 函数并重跑 `backend/scripts/build_vector_index.py` 重建索引（注意维度一致）。填充命令：`cd backend; python scripts/build_vector_index.py`（幂等，支持 `--limit` 试跑）。
+**向量检索方案与局限（阶段 B 升级后）**：选型为 Neo4j 5.26 原生 vector index（社区版，作用于普通 `LIST<FLOAT>` 属性，免独立向量库运维）。嵌入经 `services/embedding_provider.py` 统一抽象，三种 Provider 由 `.env` 的 `EMBEDDING_PROVIDER` 切换：
+
+- `hash`（默认）：纯 Python 哈希字符 n-gram（blake2b 特征哈希，`EMBEDDING_DIM` 维，零依赖）。**只能捕捉字面重合，不具备语义理解**，对「脑子里嗡嗡响」这类口语改写召回有限（基线实测见下节）；
+- `zhipu`：智谱 embedding-3（REST，批次 64）；`tongyi`：通义 text-embedding-v3（OpenAI 兼容 REST，批次 10），语义维度 `SEMANTIC_EMBEDDING_DIM`（默认 512）。均只走 httpx，零重型依赖（不引入 torch/厂商 SDK）；
+- `qwen`（**当前生产启用**）：千问 `qwen3.7-text-embedding` 专属部署（百炼 MaaS 网关，OpenAI 兼容 `/compatible-mode/v1/embeddings`，`EMBED_API_BASE_URL` + `EMBEDDING_MODEL` + `DASHSCOPE_API_KEY` 配置，批次上限 10，实测支持 `dimensions=512` 且输出 L2 归一化）；
+- **降级不中断**：未配 Key / 调用失败 / 超时（默认 2s）/ 连续失败熔断开 → 自动回退哈希嵌入（维度自动对齐 Neo4j 现存索引实际维度），打 WARNING 不抛异常，问答照常返回；
+- **成本可控**：`build_vector_index.py --dry-run` 打印实体数 / 预估 tokens / 预估费用，超 `EMBEDDING_MAX_COST_YUAN` 中止；语义模式下 **MySQL `entity_embeddings` 表为 source of truth**（主键含 provider+model_ver，换模型并存、可精准失效；存 float32 BLOB），增量只算缺行、每批 500 条落库即 checkpoint、中断重跑自动续；
+- **维度变更**：Neo4j 向量索引不支持改维度，脚本自动检测并 DROP→CREATE 再从 MySQL 重写副本（不残留旧索引）。
+
+建库/填充命令：`cd backend; python scripts/build_vector_index.py [--dry-run|--limit N]`（幂等）。语义升级操作顺序：配 Key → `--dry-run` 复核费用 → 全量建库（自动完成换维）→ 重跑评测对比，视数据决定是否上调 `HYBRID_VECTOR_WEIGHT`。
+
+**检索质量评测（B0 基线 → qwen 语义升级对比）**：`scripts/eval_recall.py` 以 30 条口语化 query（如「脑子里嗡嗡响」「心跳忽快忽慢」，期望实体与图谱核对一致）评测三路召回。同一评测集、同一融合权重（0.6/0.4，未凭感觉调参）：
+
+| 路径 | 哈希基线 R@1 / R@5 / MRR / 未命中 | qwen 语义 R@1 / R@5 / MRR / 未命中 |
+|------|-----------------------------------|-----------------------------------|
+| 关键词路 | 0.00% / 0.00% / 0.0000 / 30 | 0.00% / 0.00% / 0.0000 / 30（不经向量，不变） |
+| 向量路 | 0.00% / 0.00% / **0.0081** / 27 | 10.00% / 23.33% / **0.1871** / 6 |
+| 融合路 | 0.00% / 0.00% / 0.0000 / 30 | **16.67%** / 23.33% / **0.1844** / 23* |
+
+\* 融合路只出前 6 锚点，其"未命中"窗口天然小于向量路 top-20，两行不可直接比。
+
+结论（如实）：语义升级收益可量化——向量路 MRR 提升约 23 倍、R@5 从 0 到 23.3%、未命中 27→6；「脑子里嗡嗡响」生产实测锚点 top1=耳鸣（哈希版全程 miss）。但**多数命中落在 rank 7~20**（R@1 仅 10%），主因即 C4 预判：当前仅嵌实体名、信息量不足（如「空腹痛吃点东西就缓解」→ 消化性溃疡 rank20）。**`HYBRID_VECTOR_WEIGHT` 暂保持 0.4 不上调**：数据尚不支持向量路主导；下一步按计划拼接简介重跑评测后再定。剩余 6 条 miss（白血病/哮喘/甲亢/抑郁症/肺炎/前列腺增生）为语义距离过远的口语改写，属实体名词条本身的表达局限。
+
+**成本实测**：全量 18633 实体（token 预估按字符数，比网关实际 prompt_tokens 低约 8 倍，实际费用约在 0.5 元量级、仍远低于 10 元阈值）；耗时约 10 分钟；MySQL `entity_embeddings` 存 18633×512×4B ≈ 38MB。生产验证：查询侧远程嵌入 + 60s 缓存 + 2s 超时降级 + 熔断三件套已在 8000 实例实测通过（无降级告警），`/api` 契约测试 56 项在 qwen 模式下全绿。
 
 **急症红牌（3.6）**：关键词/模式表存于 `backend/data/red_flags.json`（中文注释、可扩展）。命中后先发 `emergency` 帧，再发固定急诊引导（立即拨打 120/前往急诊 + 免责声明），直接 `[DONE]`，**不进行图谱检索与 LLM 调用**，前端渲染为红色警示卡。为降低误报，「什么是胸痛」「休克的含义」这类**概念性定义提问**（命中强定义句式、且不含第一人称/急迫措辞）会豁免红牌、交回意图路由按百科/检索作答；任何真急症自述（如「我突然胸痛喘不上气」）仍立即触发，判据保守以安全优先。
 
@@ -402,25 +425,33 @@ QASystemOnMedicalKG-master/
 | 索引与约束 | 七类实体 `name` 唯一约束（重名自动降级普通索引），启动/建图时幂等执行 | 查询提速且防重复实体 |
 | 别名归一化 | 口语别名统一映射到规范实体名后查询，未命中原词兜底 | 提升召回率，避免 0 召回 |
 | 诊断加权 | 症状 IDF + 疾病先验阻尼加权替代简单重合度计数 | 常见病与心血管等关键疾病排序更合理 |
+| 存储层 MySQL 化（阶段 A） | 五处 JSON → MySQL 8（SQLAlchemy 2.0 Core + PyMySQL），`store.py` 内存态读缓存 + `save_json_async` 事务内 diff 增量写；连接池 `pool_pre_ping` + `pool_recycle` | 消除并发写文件竞态；删号一条外键级联清干净；`STORE_BACKEND=json\|sql` 一键回滚 |
+| jti 黑名单入表（阶段 A） | 登出/换票黑名单写 `jti_blacklist` 表 + 进程内 5s 限频镜像 | 多 worker 共享、重启后旧令牌依旧失效 |
 
 ---
 
 ## 七、部署指南
 
-### 7.1 环境要求
+### 7.1 环境要求（统一 WSL2 方案）
+
+**所有组件收敛在 WSL2 内，零跨边界部署**：代码放 WSL 原生文件系统（如 `~/projects/medicalkg`，**不要放 `/mnt/c/`**——inotify 不触发会导致 uvicorn `--reload` 与 vite HMR 失效、跨文件系统 I/O 慢数倍、venv/node_modules 不可跨系统复用），Neo4j/MySQL 用 WSL 内 docker，后端前端跑 WSL，组件间一律 `127.0.0.1` 回环；唯一剩余边界是 Windows 浏览器 → WSL，依赖 WSL2 localhostForwarding，通常 `localhost` 直连即可。VS Code 用 Remote-WSL 打开（WSL 终端执行 `code .`）。
 
 | 依赖 | 版本要求 |
 |------|---------|
-| Node.js | >= 18.x |
-| Python | >= 3.10 |
-| Neo4j | >= 5.x（社区版即可） |
+| Node.js | >= 18.x（WSL 内） |
+| Python | >= 3.10（WSL 内 venv） |
+| Neo4j | 5.26 社区版（WSL 内 docker） |
+| MySQL | 8.0（WSL 内 docker） |
+| Docker | WSL 内可用（Docker Desktop WSL 集成 或 WSL 内 docker engine，后者重启 WSL 需 `sudo service docker start`） |
 | npm | >= 9.x |
 
 ### 7.2 Neo4j 数据库
 
-1. 安装并启动 Neo4j 5.x，访问 `http://localhost:7474`
+**推荐：WSL 内容器化**（`docker compose up -d neo4j`，官方 `neo4j:5.26` 镜像，`neo4j-data` 卷持久化；compose 已按 WSL 实机内存配置 heap/pagecache 各 1G，请按本机实际调整）。注意端口 7474/7687 冲突：若 Windows 侧曾有原生 Neo4j，验证新环境可用前先停掉它但**保留作回退**，不要急于卸载清数据。
+
+1. 启动后访问 `http://localhost:7474`
 2. 默认连接地址：`bolt://localhost:7687`，用户名 `neo4j`；密码不再硬编码，统一通过环境变量/`.env` 提供（建图脚本读取 `backend/.env` 的 `NEO4J_PASSWORD`，未配置时报错退出）
-3. 导入数据（建图前自动幂等创建索引/约束）：
+3. 导入数据（建图前自动幂等创建索引/约束）。**导入后必须核对节点/关系总数**（本语料应为 44111 节点 / 291112 关系、疾病 8807），数字对不上要查原因再往下走：
 
 ```bash
 python build_medicalgraph.py
@@ -460,6 +491,14 @@ python -m uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 
 后端 API 文档：http://localhost:8000/docs
 
+**持久化方案（阶段 A：五处 JSON → MySQL 8，可回滚）**：
+
+- 开关：`backend/.env` 的 `STORE_BACKEND=json|sql`，改一个环境变量重启即可切换/回退；两种取值下 `/api` 契约完全一致（契约测试双后端各 56 项全绿验证）。默认 json，验证通过后当前生产已切至 sql。
+- 表结构（`core/db.py` 启动幂等建表，SQLAlchemy 2.0 Core + PyMySQL，不引入 ORM）：`users` 主表 + `user_profiles` / `health_records` / `health_plans` / `chat_history` 四子表（`username` 外键 `ON DELETE CASCADE`，删号自动全清）+ `jti_blacklist`（登出黑名单入表，跨进程/重启仍失效）+ `entity_embeddings`（阶段 B 语义嵌入真源，主键含 provider+model_ver）。档案敏感字段保持 Fernet 密文**原样搬运**，未换加密方案。
+- 运行形态：启动时整表装载为内存字典（读路径零改动），`save_json_async` 对库做事务内 diff 增量同步（upsert 变更 + 删除消失）；连接池开 `pool_pre_ping` + `pool_recycle`。sql 模式下 MySQL 连不通**明确报错拒启**，不静默回退 JSON 造成分叉。
+- 迁移：`cd backend; python scripts/migrate_json_to_mysql.py --dry-run` 预估 → 去掉 `--dry-run` 执行。脚本幂等可重跑（二次跑差异 0）、逐表计数校验、随机抽样逐字段比对、原 JSON 复制为 `.json.bak`（保留原文件不删）。
+- 地址不写死：后端在 WSL 宿主机跑用 `MYSQL_HOST=127.0.0.1`；后端进容器改服务名 `mysql`。MySQL 容器端口只映射 `127.0.0.1:3306` 不暴露局域网；业务用 `kguser` 专用账号（非 root，只授业务库增删改查）。认证用 MySQL 8 默认 `caching_sha2_password`（已装 cryptography，不改 native）。
+
 ### 7.4 前端启动
 
 ```bash
@@ -487,12 +526,18 @@ npm run build
 
 ### 7.6 容器化一键部署（阶段五）
 
-仓库根提供 `docker-compose.yml`，一条命令拉起 Neo4j + 后端 + 前端：
+仓库根提供 `docker-compose.yml`，一条命令拉起 Neo4j + MySQL + 后端 + 前端：
 
 ```bash
-cp backend/.env.example .env   # 至少填 NEO4J_PASSWORD、JWT_SECRET（PROFILE_ENCRYPTION_KEY 可选）
+# 根目录 .env 同时供 compose 变量替换与后端容器 env_file 使用：
+# 需包含 NEO4J_PASSWORD / MYSQL_ROOT_PASSWORD / MYSQL_PASSWORD（compose 层）
+# 以及 backend/.env.example 里的 JWT_SECRET 等后端运行变量（合并为一份）
+cp backend/.env.example .env   # 再补 MYSQL_ROOT_PASSWORD / MYSQL_PASSWORD 两行
 docker compose up -d --build
 ```
+
+- compose 已含 `mysql:8.0` 服务：utf8mb4、数据卷 `mysql-data` 持久化、端口**只映射 `127.0.0.1:3306`**；`kguser` 专用账号（非 root）。根目录 `.env` 提供 `NEO4J_PASSWORD / MYSQL_ROOT_PASSWORD / MYSQL_PASSWORD` 三值。
+- 日常开发按第七章 WSL 方案：容器只跑 neo4j + mysql（`docker compose up -d neo4j mysql`），后端前端在 WSL 宿主机直跑热重载；`MYSQL_HOST=127.0.0.1`。整栈容器化时后端容器内用 `MYSQL_HOST=mysql`、`NEO4J_URI=bolt://neo4j:7687`。
 
 - 首次启动时后端 `entrypoint.sh` 自动等待 Neo4j → 导入 47MB `data/medical.json` 建图 → 执行阶段二迁移与阶段三向量索引（幂等：检测到已有数据即跳过）；数据经 `neo4j-data` 卷持久化，二次启动秒级拉起。
 - 前端 http://localhost:8080（Nginx 托管静态资源并反代 `/api` 到后端，已对 SSE 关闭缓冲）；API http://localhost:8000；探活 `GET /health`。
@@ -581,7 +626,11 @@ docker compose up -d --build
 
 | 限制项 | 说明 |
 |-------|------|
-| 用户数据存储 | 使用 JSON 文件持久化，生产环境应迁移至数据库 |
+| 用户数据存储 | 已迁 MySQL（阶段 A，`STORE_BACKEND=sql`）；json 后端保留为回滚路径，但**切换 sql 后 JSON 文件不再更新**，长期双切换需以 MySQL 为准回导 |
+| 语义嵌入 | 已接入千问 `qwen3.7-text-embedding`（专属 MaaS 部署，512 维）；评测显示多数命中在 rank 7~20，R@1 仍低——受制于仅嵌实体名的短语料 |
+| 嵌入只含实体名 | 语义索引语料仅实体名（C4），拼接简介增强待下一步验证（换语料=新 model_ver 重算，MySQL 新旧并存） |
+| 嵌入服务依赖外网 | 专属网关不可达/超时自动降级哈希（熔断 60s），向量路质量回落但问答不中断；费用预估按字符数低估网关实际 token 约 8 倍 |
+| 多 worker 写竞态 | sql 模式仍为「单 worker 内存态 + diff 同步」，多 worker 需改写路径为行级（jti 已入表不受影响） |
 | DeepSeek API | 需自行申请 API 密钥，未配置时使用降级模式 |
 | PDF 导出 | 健康档案 PDF 导出功能为前端占位，需集成 jsPDF |
 | 知识图谱更新 | 当前为静态数据导入，不支持实时更新 |
@@ -591,8 +640,8 @@ docker compose up -d --build
 
 ### 10.2 未来规划
 
-- **数据库迁移**：用户数据迁移至 PostgreSQL / MySQL，支持高并发
-- **向量检索**：集成 Embedding 模型，支持语义相似度查询
+- ~~**数据库迁移**：用户数据迁移至 PostgreSQL / MySQL~~ ✅ 已完成（阶段 A：MySQL 8，`STORE_BACKEND` 可回滚）
+- ~~**语义嵌入全量落地**~~ ✅ 已完成（qwen3.7-text-embedding，512 维，评测对比与决策见 3.9）；后续：简介拼接增强语料（新 model_ver 重算）后再评一次，按数据决定是否上调 `HYBRID_VECTOR_WEIGHT`
 - **多模态问答**：支持图片上传（如检查报告 OCR）辅助诊断
 - **实时图谱更新**：对接医疗数据源，定期增量更新知识图谱
 - **移动端适配**：响应式布局优化，支持手机端访问

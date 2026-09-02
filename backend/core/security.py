@@ -10,6 +10,7 @@
 """
 
 import hashlib
+import logging
 import threading
 import time
 import uuid
@@ -24,7 +25,10 @@ from .config import (
     ALGORITHM,
     JWT_SECRET,
     REFRESH_TOKEN_EXPIRE_DAYS,
+    STORE_BACKEND,
 )
+
+logger = logging.getLogger("core.security")
 
 # ========== 密码哈希 ==========
 
@@ -128,11 +132,18 @@ def validate_access_payload(payload: dict, users_db: dict) -> str:
     return username
 
 
-# ========== jti 黑名单（进程内，登出即时失效） ==========
+# ========== jti 黑名单（json：纯进程内；sql：DB 为准 + 进程内镜像） ==========
 
-# jti -> 过期时间戳（秒）；get 时惰性清理过期项，避免无限增长
+# jti -> 过期时间戳（秒）；get 时惰性清理过期项，避免无限增长。
+# sql 后端下本字典是 jti_blacklist 表的读镜像（限频刷新），写路径双写：
+# 解决进程内黑名单多 worker 不共享、重启即清零的问题（登出/换票后旧令牌
+# 跨进程、跨重启依旧失效）。
 _BLACKLIST: dict[str, float] = {}
 _BLACKLIST_LOCK = threading.Lock()
+
+# 镜像自 DB 的刷新限频（秒）：黑名单规模受令牌有效期约束很小，全量拉取即可
+_JTI_SYNC_SECONDS = 5.0
+_jti_last_sync = 0.0
 
 
 def _purge_expired(now: float):
@@ -143,19 +154,47 @@ def _purge_expired(now: float):
 
 
 def revoke_jti(jti: str, exp_ts: float = None):
-    """将 jti 加入黑名单；exp_ts 为该令牌原本的过期时间戳（用于惰性清理）"""
+    """将 jti 加入黑名单；exp_ts 为该令牌原本的过期时间戳（用于惰性清理）。
+
+    sql 后端下写 DB 失败直接抛出（与业务数据写失败的行为一致），
+    不静默吞掉——否则会造成「以为登出了实际没登出」的安全假象。
+    """
     if not jti:
         return
+    exp = exp_ts if exp_ts else time.time() + 7 * 24 * 3600
+    if STORE_BACKEND == "sql":
+        from . import db
+        db.jti_revoke(jti, exp)
     with _BLACKLIST_LOCK:
         _purge_expired(time.time())
-        _BLACKLIST[jti] = exp_ts if exp_ts else time.time() + 7 * 24 * 3600
+        _BLACKLIST[jti] = exp
 
 
 def is_revoked(jti: str) -> bool:
-    """查询 jti 是否已被吊销，顺带清理过期条目"""
+    """查询 jti 是否已被吊销，顺带清理过期条目。
+
+    sql 后端：镜像命中即真；未命中且超过限频窗口则先从 DB 全量刷新未过期
+    条目再判定（覆盖重启后旧令牌、其他 worker 登出两种场景）；
+    DB 刷新失败仅记 WARNING 并按镜像判定，不阻断认证链路。
+    """
     if not jti:
         return False
+    global _jti_last_sync
     now = time.time()
     with _BLACKLIST_LOCK:
         _purge_expired(now)
-        return jti in _BLACKLIST
+        if jti in _BLACKLIST:
+            return True
+        if STORE_BACKEND == "sql" and now - _jti_last_sync >= _JTI_SYNC_SECONDS:
+            try:
+                from . import db
+                _jti_last_sync = time.time()
+                remote = db.jti_active()
+                db.jti_purge_expired()
+            except Exception as e:  # noqa: BLE001 降级：DB 不可用时按镜像判定
+                logger.warning("jti 黑名单刷新失败，暂用本地镜像判定: %s", e)
+            else:
+                _BLACKLIST.clear()
+                _BLACKLIST.update(remote)
+                return jti in _BLACKLIST
+        return False

@@ -10,3 +10,5 @@ python-dotenv>=1.0.0
 # build_medicalgraph.py（离线建图/数据导入脚本，CI 与 docker entrypoint 首次灌数据需要）
 # 依赖 py2neo；Web 服务运行时仅用官方 neo4j 驱动，不依赖此包
 py2neo>=2021.2.4
+sqlalchemy>=2.0
+pymysql>=1.1.0

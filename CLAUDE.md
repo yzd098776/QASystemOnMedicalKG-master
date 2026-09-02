@@ -30,7 +30,9 @@
 | 技术 | 用途 |
 |------|------|
 | Python FastAPI | API 服务（端口 8000） |
-| Neo4j | 图数据库 |
+| Neo4j 5.26 社区版 | 图数据库（WSL2 docker） |
+| MySQL 8 | 用户数据持久化（`STORE_BACKEND=sql`；json 后端保留为回滚路径） |
+| SQLAlchemy 2.0 Core + PyMySQL | 存储层（`backend/core/db.py`，不引入 ORM） |
 | DeepSeek | LLM 问答引擎 |
 | python-dotenv | 环境变量管理 |
 
@@ -45,6 +47,23 @@ JWT_SECRET=your-secret
 ```
 
 ## 常用命令
+
+工程化入口为根目录 `Makefile`（`make help` 列全部目标）：
+
+```bash
+make doctor          # W0 环境自检（代码路径/Python/docker/venv 依赖/node_modules）
+make up              # ★ 一键启动：neo4j+mysql 容器 + 后端（8000）
+make up-all          # 容器 + 后端 + 前端（5173）
+make status          # 容器/端口/日志尾一览
+make logs            # 跟随前后端日志
+make stop / down     # 停应用 / 停全部（数据卷保留）
+make run             # 后端前台热重载（开发用，Ctrl-C 停）
+make migrate         # JSON → MySQL 幂等迁移
+make test            # json+sql 双后端契约测试
+make build-vectors   # 向量索引费用预估（--dry-run）
+```
+
+进程 PID 与日志在 `.run/`（已 gitignore）。手工方式仍可：
 
 ```bash
 # 前端开发
@@ -138,5 +157,6 @@ Vite 开发服务器将 `/api` 请求代理到 `http://localhost:8000`，SSE 请
 - 路由查询参数：`/kg?entity=感冒` 定位实体，`/chat?q=问题` 预填输入
 - 实体详情抽屉支持"咨询 AI"按钮，自动生成对应类型提问
 - 用户健康档案为 `null` 时，后端使用 `body.get("profile") or default` 防止 `NoneType` 错误
-- JSON 数据文件：`users.json`、`profiles.json`、`health_records.json`、`health_plans.json`、`chat_history.json`
+- 用户数据经 `STORE_BACKEND=sql` 持久化到 MySQL（medicalkg 库，docker 内 127.0.0.1:3306）；`backend/*.json` 为回滚路径备份（另有 `.json.bak` 迁移前快照），sql 模式下不再更新
+- 嵌入 Provider 经 `EMBEDDING_PROVIDER` 切换（hash/zhipu/tongyi），远程失败自动降级哈希且维度对齐索引；评测脚本 `backend/scripts/eval_recall.py`
 - AI 生成的健康计划自动保存到 `health_plans.json`，前端「计划历史」tab 可回看和一键清理

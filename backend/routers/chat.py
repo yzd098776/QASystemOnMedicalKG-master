@@ -158,3 +158,17 @@ async def clear_chat_history(username: str = Depends(get_current_user)):
     chat_history_db[username] = {"sessions": []}
     await save_json_async(CHAT_HISTORY_FILE, chat_history_db)
     return {"ok": True}
+
+
+@router.delete("/api/chat/history/{session_id}")
+async def delete_chat_session(session_id: str, username: str = Depends(get_current_user)):
+    """删除单个会话并持久化（修复：此前前端仅本地移除、后端无单删接口，
+    重启后已删会话会从存储中复活）。会话不存在同样返回 ok，保持幂等。"""
+    history = chat_history_db.get(username)
+    if history:
+        sessions = history.get("sessions", [])
+        kept = [s for s in sessions if s.get("id") != session_id]
+        if len(kept) != len(sessions):
+            history["sessions"] = kept
+            await save_json_async(CHAT_HISTORY_FILE, chat_history_db)
+    return {"ok": True}

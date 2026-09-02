@@ -22,6 +22,7 @@ export default defineConfig({
     },
   },
   server: {
+    host: '0.0.0.0', // WSL 内监听全网卡，Windows 浏览器经 localhostForwarding 可访问
     port: 5173,
     proxy: {
       '/api': {
